@@ -29,32 +29,20 @@ class FW_SM_Importer {
 	const TEMP_PREFIX = '_fwsm_';
 
 	/**
-	 * Statements executed per slice.
-	 */
-	const STATEMENTS_PER_SLICE = 400;
-
-	/** @var string Absolute path of the extracted dump. */
-	private $dump_path;
-
-	/**
-	 * @param string $dump_path
-	 */
-	public function __construct( $dump_path ) {
-		$this->dump_path = $dump_path;
-	}
-
-	/**
 	 * Option names whose destination value must survive an import.
 	 *
 	 * @return string[]
 	 */
+	/**
+	 * Every option this extension owns starts with this.
+	 *
+	 * Treated as a namespace so that adding an option later cannot reintroduce
+	 * the inheritance bug by being forgotten from a list.
+	 */
+	const OPTION_NAMESPACE = 'fw_sm_';
+
 	public static function preserved_options() {
 		$preserved = [
-			// Losing these mid-import would strand the migration itself.
-			FW_SM_State::OPTION,
-			FW_SM_Runner::TOKEN_OPTION,
-			FW_SM_Queue::SCHEMA_OPTION,
-			'fw_sm_settings',
 			// Replacing the destination's active plugins with the source's is how
 			// you end up with an import that half-runs and then fatals.
 			'active_plugins',
@@ -62,6 +50,12 @@ class FW_SM_Importer {
 			'siteurl',
 			'home',
 		];
+
+		// This extension's own options are handled as a NAMESPACE rather than
+		// as a list — see OPTION_NAMESPACE. Listing them individually was the
+		// bug: a name absent from the destination was skipped rather than
+		// removed, so the source's copy survived the swap and the destination
+		// woke up believing it was mid-migration to somewhere else.
 
 		/**
 		 * Filters the options whose destination values survive an import.
@@ -89,6 +83,24 @@ class FW_SM_Importer {
 			}
 		}
 
+		// Everything in this extension's namespace, recorded separately because
+		// it is restored differently: the namespace is wiped after the swap and
+		// rebuilt from this, so an option the destination did NOT have ends up
+		// absent rather than inherited from the source.
+		$captured['namespace'] = [];
+
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE %s", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				$wpdb->esc_like( self::OPTION_NAMESPACE ) . '%'
+			),
+			ARRAY_A
+		);
+
+		foreach ( (array) $rows as $row ) {
+			$captured['namespace'][ $row['option_name'] ] = $row['option_value'];
+		}
+
 		return $captured;
 	}
 
@@ -106,6 +118,29 @@ class FW_SM_Importer {
 		foreach ( (array) ( $captured['options'] ?? [] ) as $name => $value ) {
 			update_option( $name, $value );
 		}
+
+		// The whole namespace is destination-owned, so it is emptied and then
+		// rebuilt. Updating in place would leave any of the source's entries
+		// that the destination lacked — which is how a freshly migrated site
+		// inherits a migration in progress, a run token, and a pointer at
+		// somebody else's destination.
+		$wpdb->query(
+			$wpdb->prepare(
+				"DELETE FROM {$wpdb->options} WHERE option_name LIKE %s", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				$wpdb->esc_like( self::OPTION_NAMESPACE ) . '%'
+			)
+		);
+
+		foreach ( (array) ( $captured['namespace'] ?? [] ) as $name => $value ) {
+			$wpdb->insert(
+				$wpdb->options,
+				[ 'option_name' => $name, 'option_value' => $value, 'autoload' => 'no' ]
+			);
+		}
+
+		// The swap replaced the table under WordPress's feet and the deletes
+		// above went straight to SQL, so anything cached is now a lie.
+		wp_cache_flush();
 
 		$destination_prefix = $wpdb->prefix;
 
@@ -142,52 +177,53 @@ class FW_SM_Importer {
 	}
 
 	/**
-	 * Execute a slice of the dump.
+	 * Execute a batch of SQL arriving over the wire.
 	 *
-	 * @param int $byte_offset Where in the file to resume from.
+	 * Same rules as loading from a file — statements are redirected to staging
+	 * tables and constraints are set aside — but the source is a string that
+	 * came from another server, so it is parsed defensively: statement
+	 * boundaries are found the same way the exporter writes them, one statement
+	 * per line ending in a semicolon.
 	 *
-	 * @return array|WP_Error [ 'offset', 'statements', 'tables', 'deferred', 'done' ]
+	 * @param string $sql
+	 *
+	 * @return array|WP_Error [ 'statements', 'tables', 'deferred' ]
 	 */
-	public function run_slice( $byte_offset = 0 ) {
+	public function run_statements( $sql ) {
 		global $wpdb;
-
-		$handle = @fopen( $this->dump_path, 'rb' ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
-
-		if ( ! $handle ) {
-			return new WP_Error(
-				'fw_sm_dump_missing',
-				__( 'The database dump could not be opened. The archive may be incomplete.', 'fw' )
-			);
-		}
-
-		if ( $byte_offset > 0 ) {
-			fseek( $handle, $byte_offset );
-		}
 
 		$executed = 0;
 		$tables   = [];
 		$deferred = [];
 		$buffer   = '';
 
-		while ( $executed < self::STATEMENTS_PER_SLICE && ! feof( $handle ) ) {
-			$line = fgets( $handle ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+		// Bulk-load settings for the duration of this batch.
+		//
+		// autocommit off means one commit for the whole batch instead of one
+		// per statement, which on InnoDB is a disk flush each time. unique and
+		// foreign key checks are redundant here: the data came from a database
+		// that already enforced them, and re-verifying every row against
+		// indexes that are still being built is pure cost.
+		$wpdb->query( 'SET autocommit = 0' );
+		$wpdb->query( 'SET unique_checks = 0' );
+		$wpdb->query( 'SET foreign_key_checks = 0' );
 
-			if ( false === $line ) {
-				break;
-			}
+		$restore = static function () use ( $wpdb ) {
+			$wpdb->query( 'COMMIT' );
+			$wpdb->query( 'SET unique_checks = 1' );
+			$wpdb->query( 'SET foreign_key_checks = 1' );
+			$wpdb->query( 'SET autocommit = 1' );
+		};
 
+		foreach ( preg_split( "/\r\n|\n|\r/", (string) $sql ) as $line ) {
 			$trimmed = trim( $line );
 
-			// Comments and blank lines carry no statement.
 			if ( '' === $trimmed || 0 === strpos( $trimmed, '--' ) ) {
 				continue;
 			}
 
-			$buffer .= $line;
+			$buffer .= $line . "\n";
 
-			// Statements are written one per line by the exporter, so a line
-			// ending in a semicolon closes one. Multi-line values inside a
-			// quoted string keep accumulating until their statement ends.
 			if ( ';' !== substr( $trimmed, -1 ) ) {
 				continue;
 			}
@@ -199,7 +235,6 @@ class FW_SM_Importer {
 				continue;
 			}
 
-			// Constraints are set aside for after the swap, against live names.
 			if ( self::is_deferred_constraint( $raw ) ) {
 				$deferred[] = $raw;
 				continue;
@@ -218,14 +253,19 @@ class FW_SM_Importer {
 			$result = $wpdb->query( $statement ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
 
 			if ( false === $result && '' !== $wpdb->last_error ) {
-				fclose( $handle ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+				$error = $wpdb->last_error;
+
+				// Commit what did land: the staging tables are discarded on
+				// failure anyway, and leaving a transaction open would hold
+				// locks on the destination until its connection times out.
+				$restore();
 
 				return new WP_Error(
 					'fw_sm_import_query',
 					sprintf(
 						/* translators: %s: database error message. */
-						__( 'The import stopped on a database error: %s', 'fw' ),
-						$wpdb->last_error
+						__( 'The destination stopped on a database error: %s', 'fw' ),
+						$error
 					)
 				);
 			}
@@ -233,17 +273,12 @@ class FW_SM_Importer {
 			$executed++;
 		}
 
-		$offset = ftell( $handle );
-		$done   = feof( $handle ) && '' === trim( $buffer );
-
-		fclose( $handle ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+		$restore();
 
 		return [
-			'offset'     => (int) $offset,
 			'statements' => $executed,
 			'tables'     => $tables,
 			'deferred'   => $deferred,
-			'done'       => $done,
 		];
 	}
 
@@ -360,7 +395,21 @@ class FW_SM_Importer {
 		}
 
 		$old_suffix = '_fwsm_old';
-		$pairs      = [];
+
+		// Clear anything a previous attempt left displaced. Without this, the
+		// rename of a live table to its _fwsm_old name collides with the corpse
+		// of the last failed run and the whole swap fails — on a network of 600
+		// tables that is a near-certainty after any earlier failure.
+		foreach ( $tables as $live ) {
+			$stale = $live . $old_suffix;
+
+			if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $stale ) ) === $stale ) {
+				$wpdb->query( "DROP TABLE IF EXISTS `{$stale}`" ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			}
+		}
+
+		$pairs   = [];
+		$swapped = [];
 
 		foreach ( $tables as $live ) {
 			$temp = self::TEMP_PREFIX . $live;
@@ -369,15 +418,14 @@ class FW_SM_Importer {
 				continue;
 			}
 
-			// Move the live table aside and the staging table in, in one
-			// statement, so there is no moment where neither exists.
 			$exists = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $live ) ) === $live;
 
 			if ( $exists ) {
-				$pairs[] = "`{$live}` TO `{$live}{$old_suffix}`, `{$temp}` TO `{$live}`";
-			} else {
-				$pairs[] = "`{$temp}` TO `{$live}`";
+				$pairs[] = "`{$live}` TO `{$live}{$old_suffix}`";
 			}
+
+			$pairs[]   = "`{$temp}` TO `{$live}`";
+			$swapped[] = $live;
 		}
 
 		if ( empty( $pairs ) ) {
@@ -387,26 +435,39 @@ class FW_SM_Importer {
 			);
 		}
 
+		// ONE statement, not one per table.
+		//
+		// MySQL executes a multi-pair RENAME TABLE atomically: every pair moves
+		// or none does. Renaming in a loop meant a failure partway through left
+		// the destination half-swapped — some tables from the migration, some
+		// its own — which is precisely the state this class promises can never
+		// happen. With 600 tables a mid-loop failure stops being hypothetical.
+		$sql = 'RENAME TABLE ' . implode( ', ', $pairs );
+
 		$wpdb->query( 'SET FOREIGN_KEY_CHECKS = 0' );
 
-		foreach ( $pairs as $pair ) {
-			$result = $wpdb->query( "RENAME TABLE {$pair}" ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared,WordPress.DB.PreparedSQL.NotPrepared
+		$result = $wpdb->query( $sql ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
 
-			if ( false === $result ) {
-				$wpdb->query( 'SET FOREIGN_KEY_CHECKS = 1' );
-
-				return new WP_Error(
-					'fw_sm_swap_failed',
-					sprintf(
-						/* translators: %s: database error message. */
-						__( 'Could not put the imported tables in place: %s', 'fw' ),
-						$wpdb->last_error
-					)
-				);
-			}
-		}
+		// Read the error BEFORE any other query. A successful statement clears
+		// $wpdb->last_error, so cleaning up first throws away the only
+		// explanation there was — which is how this failure first appeared as
+		// "Could not put the imported tables in place:" with nothing after it.
+		$error = (string) $wpdb->last_error;
 
 		$wpdb->query( 'SET FOREIGN_KEY_CHECKS = 1' );
+
+		if ( false === $result ) {
+			return new WP_Error(
+				'fw_sm_swap_failed',
+				sprintf(
+					/* translators: 1: database error, 2: number of tables. */
+					__( 'Could not put the imported tables in place (%2$d tables): %1$s', 'fw' ),
+					'' !== $error ? $error : __( 'the database gave no reason', 'fw' ),
+					count( $swapped )
+				),
+				[ 'tables' => count( $swapped ), 'statement_bytes' => strlen( $sql ) ]
+			);
+		}
 
 		return true;
 	}

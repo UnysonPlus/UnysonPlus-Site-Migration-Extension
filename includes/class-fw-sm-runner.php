@@ -31,6 +31,9 @@ class FW_SM_Runner {
 	const LOCK_TRANSIENT = 'fw_sm_lock';
 	const TOKEN_OPTION  = 'fw_sm_run_token';
 
+	/** Where the source stores the destination it is connected to. */
+	const DESTINATION_OPTION_NAME = 'fw_sm_destination';
+
 	/**
 	 * How long the process lock is held. Longer than the minimum cron interval,
 	 * so the healthcheck cannot barge in on a slice that is merely slow.
@@ -46,6 +49,13 @@ class FW_SM_Runner {
 	 * Fraction of memory_limit a slice will consume before yielding.
 	 */
 	const MEMORY_BUDGET_RATIO = 0.8;
+
+	/**
+	 * Never shrink batches below this — past a point the round trips cost more
+	 * than the data, and a destination that cannot take this much is broken
+	 * rather than merely small.
+	 */
+	const MIN_BATCH_BYTES = 262144; // 256 KB
 
 	/**
 	 * Give up on a job after this many failed attempts.
@@ -99,21 +109,31 @@ class FW_SM_Runner {
 	/**
 	 * Start a migration: create state, ensure the queue table, kick the chain.
 	 *
-	 * @param string   $direction 'export' or 'import'.
+	 * @param string   $direction Always 'push' — kept so state records stay self-describing.
 	 * @param string[] $stages
 	 * @param array    $options
 	 *
 	 * @return array|WP_Error The new state.
 	 */
 	public function start( $direction, array $stages, array $options = [] ) {
-		// The last line of defence, not the first. The screen hides the form and
-		// handle_start() refuses too, but a migration can also be started from
-		// code, and on multisite starting one is actively harmful — so the gate
-		// lives here as well, where every path has to pass through it.
-		if ( ! FW_Extension_Site_Migration::is_supported() ) {
+		// A migration can be started from code, so the mode has to be validated
+		// here as well as in the UI. An unresolved or unsupported combination
+		// must never reach the queue.
+		$mode = $options['mode'] ?? FW_SM_Multisite::MODE_SINGLE;
+
+		if ( ! in_array(
+			$mode,
+			[
+				FW_SM_Multisite::MODE_SINGLE,
+				FW_SM_Multisite::MODE_NETWORK,
+				FW_SM_Multisite::MODE_SUBSITE_TO_SINGLE,
+				FW_SM_Multisite::MODE_SINGLE_TO_SUBSITE,
+			],
+			true
+		) ) {
 			return new WP_Error(
-				'fw_sm_unsupported_install',
-				FW_Extension_Site_Migration::unsupported_reason()
+				'fw_sm_unknown_mode',
+				__( 'That combination of source and destination is not supported.', 'fw' )
 			);
 		}
 
@@ -143,7 +163,52 @@ class FW_SM_Runner {
 			wp_schedule_event( time() + MINUTE_IN_SECONDS, 'fw_sm_minute', self::CRON_HOOK );
 		}
 
-		FW_SM_State::log( __( 'Migration started.', 'fw' ) );
+		// Open the migration on the destination before any work is queued. If
+		// the destination will not accept it, the user finds out now rather than
+		// after ten minutes of scanning.
+		$sender = FW_SM_Sender::from_stored();
+
+		if ( is_wp_error( $sender ) ) {
+			FW_SM_State::finish( 'failed', $sender->get_error_message() );
+
+			return $sender;
+		}
+
+		$opened = $sender->begin(
+			$state['id'],
+			[
+				'mode'        => $options['mode'] ?? FW_SM_Multisite::MODE_SINGLE,
+				'target_slug' => $options['target_slug'] ?? '',
+			]
+		);
+
+		if ( is_wp_error( $opened ) ) {
+			FW_SM_State::finish( 'failed', $opened->get_error_message() );
+
+			return $opened;
+		}
+
+		// single -> subsite: the destination just created the receiving site and
+		// told us its id and URL. Everything downstream — table names, uploads
+		// paths, URL rewriting — depends on those, so fold them into the state
+		// before any work is queued.
+		if ( ! empty( $opened['dest_blog_id'] ) ) {
+			$state['options']['dest_blog_id'] = (int) $opened['dest_blog_id'];
+		}
+
+		if ( ! empty( $opened['dest_url'] ) ) {
+			$state['options']['target_url'] = untrailingslashit( $opened['dest_url'] );
+		}
+
+		FW_SM_State::save( $state );
+
+		FW_SM_State::log(
+			sprintf(
+				/* translators: %s: destination site URL. */
+				__( 'Connected to %s. Starting migration.', 'fw' ),
+				$state['options']['target_url'] ?? $sender->get_url()
+			)
+		);
 
 		$this->dispatch();
 
@@ -170,20 +235,13 @@ class FW_SM_Runner {
 		$this->release_lock();
 		$this->unschedule();
 
-		// A half-written export archive is useless and can be very large.
-		if ( 'export' === $state['direction'] && ! empty( $state['options']['archive_path'] ) ) {
-			$archive = new FW_SM_Archive( $state['options']['archive_path'] );
-			$archive->delete();
+		// The destination is holding staging tables for a migration that is not
+		// coming. Tell it to drop them. Its live data was never touched — the
+		// swap only happens in finalize — so nothing there needs undoing.
+		$sender = FW_SM_Sender::from_stored();
 
-			$this->delete_working_dump( $state );
-		}
-
-		// A cancelled import has staging tables and an unpacked copy of the whole
-		// archive on disk. The destination was never touched — the swap only
-		// happens in finalize — so both are pure waste and go now.
-		if ( 'import' === $state['direction'] ) {
-			FW_SM_Importer::drop_staging_tables();
-			$this->delete_work_dir( $state );
+		if ( ! is_wp_error( $sender ) ) {
+			$sender->abort();
 		}
 	}
 
@@ -386,14 +444,8 @@ class FW_SM_Runner {
 			return $this->mark_initialized( $index, 0 );
 		}
 
-		if ( 'import' === $state['direction'] ) {
-			return $this->initialize_import_stage( $stage, $state, $index );
-		}
-
 		if ( FW_SM_Stage::DATABASE === $stage ) {
-			// The dump is written to a working file and only added to the archive
-			// once it is complete, so a half-written dump never lands inside a zip.
-			$tables      = FW_SM_DB_Export::list_tables();
+			$tables      = FW_SM_DB_Export::list_tables( $this->db_context( $state ) );
 			$total_bytes = 0;
 			$jobs        = [];
 
@@ -420,18 +472,31 @@ class FW_SM_Runner {
 		}
 
 		// File stages scan incrementally, carrying a directory stack between passes.
-		$root = FW_SM_Stage::source_dir( $stage );
+		$root = FW_SM_Stage::source_dir( $stage, (int) ( $state['options']['source_blog_id'] ?? 0 ) );
 
 		if ( null === $root ) {
 			// A missing mu-plugins directory is ordinary, not an error.
 			return $this->mark_initialized( $index, 0 );
 		}
 
-		$scanner = new FW_SM_File_Scanner(
-			$stage,
-			$root,
-			FW_SM_File_Scanner::default_excludes( $stage )
-		);
+		$excludes = FW_SM_File_Scanner::default_excludes( $stage );
+
+		// A subsite's own root is already .../uploads/sites/<id>, so the
+		// exclusion that keeps blog 1 out of sites/ would exclude everything.
+		// Paths are matched relative to the stage root, so the guard is simply
+		// not to apply it when the root is itself a subsite directory.
+		if ( FW_SM_Stage::UPLOADS === $stage && (int) ( $state['options']['source_blog_id'] ?? 0 ) > 1 ) {
+			$excludes = array_values(
+				array_filter(
+					$excludes,
+					static function ( $pattern ) {
+						return '*/sites/*' !== $pattern;
+					}
+				)
+			);
+		}
+
+		$scanner = new FW_SM_File_Scanner( $stage, $root, $excludes );
 
 		$stack_key = 'scan_stack_' . $stage;
 		$bytes_key = 'scan_bytes_' . $stage;
@@ -506,12 +571,10 @@ class FW_SM_Runner {
 
 			if ( FW_SM_Stage::FINALIZE === $stage ) {
 				$result = $this->process_finalize( $state );
-			} elseif ( 'import' === $state['direction'] ) {
-				$result = $this->process_import_stage( $stage, $state );
 			} elseif ( FW_SM_Stage::DATABASE === $stage ) {
-				$result = $this->process_database( $state );
+				$result = $this->push_database( $state );
 			} else {
-				$result = $this->process_files( $stage, $state );
+				$result = $this->push_files( $stage, $state );
 			}
 
 			if ( is_wp_error( $result ) ) {
@@ -567,516 +630,14 @@ class FW_SM_Runner {
 		}
 	}
 
-	/**
-	 * Export one table, or a slice of one.
-	 *
-	 * @param array $state
-	 *
-	 * @return array|WP_Error
-	 */
-	private function process_database( $state ) {
-		$jobs = FW_SM_Queue::peek( 2 );
 
-		$current = null;
-		$next    = null;
 
-		foreach ( $jobs as $job ) {
-			if ( FW_SM_Stage::DATABASE !== $job['stage'] ) {
-				continue;
-			}
 
-			if ( null === $current ) {
-				$current = $job;
-			} else {
-				$next = $job;
-			}
-		}
 
-		if ( null === $current ) {
-			// Queue drained: close the dump and fold it into the archive.
-			$export = $this->make_exporter( $state );
 
-			$export->set_deferred_alters( (array) FW_SM_State::cursor( 'deferred_alters', [] ) );
 
-			$footer = $export->write_footer();
 
-			if ( is_wp_error( $footer ) ) {
-				return $footer;
-			}
 
-			$archive = new FW_SM_Archive( $state['options']['archive_path'] );
-
-			$added = $archive->add_file( $this->dump_path( $state ), 'database.sql' );
-
-			if ( is_wp_error( $added ) ) {
-				return $added;
-			}
-
-			$this->delete_working_dump( $state );
-
-			FW_SM_State::log( __( 'Database export finished.', 'fw' ) );
-
-			return [ 'processed_bytes' => 0, 'complete' => true ];
-		}
-
-		$table  = $current['payload']['table'] ?? '';
-		$export = $this->make_exporter( $state );
-
-		$export->set_deferred_alters( (array) FW_SM_State::cursor( 'deferred_alters', [] ) );
-
-		// First slice for this table: header (once per dump) and schema.
-		if ( FW_SM_State::cursor( 'db_table' ) !== $table ) {
-			if ( ! FW_SM_State::cursor( 'db_header_written' ) ) {
-				$header = $export->write_header(
-					[
-						'site_url'     => $state['options']['source_url'] ?? '',
-						'table_prefix' => $GLOBALS['wpdb']->prefix,
-					]
-				);
-
-				if ( is_wp_error( $header ) ) {
-					return $header;
-				}
-
-				FW_SM_State::set_cursor( [ 'db_header_written' => true ] );
-			}
-
-			$schema = $export->write_schema( $table );
-
-			if ( is_wp_error( $schema ) ) {
-				return $schema;
-			}
-
-			FW_SM_State::set_cursor(
-				[
-					'db_table'        => $table,
-					'db_last_key'     => '',
-					'db_offset'       => 0,
-					'db_key_col'      => FW_SM_DB_Export::primary_key( $table ),
-					'deferred_alters' => $export->get_deferred_alters(),
-				]
-			);
-		}
-
-		$key_col = (string) FW_SM_State::cursor( 'db_key_col', '' );
-
-		$result = $export->write_rows(
-			$table,
-			$key_col,
-			FW_SM_State::cursor( 'db_last_key', '' ),
-			(int) FW_SM_State::cursor( 'db_offset', 0 )
-		);
-
-		if ( is_wp_error( $result ) ) {
-			$attempts = FW_SM_Queue::bump_attempts( $current['id'] );
-
-			if ( $attempts >= self::MAX_ATTEMPTS ) {
-				return $result;
-			}
-
-			// Retryable: leave the job in place and let the next slice have a go.
-			return [ 'processed_bytes' => 0, 'complete' => false ];
-		}
-
-		FW_SM_State::set_cursor(
-			[
-				'db_last_key' => $result['last_key'],
-				'db_offset'   => $result['offset'],
-			]
-		);
-
-		$rows = max( 1, (int) ( $current['payload']['rows'] ?? 1 ) );
-
-		// Prorate this table's estimated bytes across its rows so a large table
-		// shows steady movement instead of jumping when it finally finishes.
-		$processed = (int) min(
-			$current['bytes'],
-			floor( $current['bytes'] / $rows ) * $result['rows_written']
-		);
-
-		if ( $result['done'] ) {
-			FW_SM_Queue::delete( $current['id'] );
-
-			FW_SM_State::set_cursor( [ 'db_table' => '' ] );
-
-			// The last table of the stage is the one with nothing after it.
-			if ( null === $next ) {
-				return [ 'processed_bytes' => $processed, 'complete' => false ];
-			}
-		}
-
-		return [ 'processed_bytes' => $processed, 'complete' => false ];
-	}
-
-	/**
-	 * Copy a batch of files into the archive.
-	 *
-	 * @param string $stage
-	 * @param array  $state
-	 *
-	 * @return array|WP_Error
-	 */
-	private function process_files( $stage, $state ) {
-		$jobs = FW_SM_Queue::peek( FW_SM_Archive::BATCH_SIZE );
-
-		$batch    = [];
-		$job_ids  = [];
-		$archive_dir = FW_SM_Stage::archive_dir( $stage );
-
-		foreach ( $jobs as $job ) {
-			if ( $stage !== $job['stage'] ) {
-				break; // Different stage on top: this one is finished.
-			}
-
-			$batch[] = [
-				'absolute' => $job['payload']['absolute'] ?? '',
-				'archive'  => $archive_dir . '/' . ( $job['payload']['path'] ?? '' ),
-			];
-
-			$job_ids[] = $job['id'];
-		}
-
-		if ( empty( $batch ) ) {
-			FW_SM_State::log(
-				sprintf(
-					/* translators: %s: stage label. */
-					__( '%s finished.', 'fw' ),
-					FW_SM_Stage::label( $stage )
-				)
-			);
-
-			return [ 'processed_bytes' => 0, 'complete' => true ];
-		}
-
-		$archive = new FW_SM_Archive( $state['options']['archive_path'] );
-
-		$result = $archive->add_batch( $batch );
-
-		if ( is_wp_error( $result ) ) {
-			return $result;
-		}
-
-		foreach ( $job_ids as $id ) {
-			FW_SM_Queue::delete( $id );
-		}
-
-		return [ 'processed_bytes' => $result['bytes'], 'complete' => false ];
-	}
-
-	/**
-	 * Size an import stage.
-	 *
-	 * @param string $stage
-	 * @param array  $state
-	 * @param int    $index
-	 *
-	 * @return true|WP_Error
-	 */
-	private function initialize_import_stage( $stage, $state, $index ) {
-		$archive = new FW_SM_Archive( $state['options']['archive_path'] );
-
-		if ( FW_SM_Stage::EXTRACT === $stage ) {
-			$measured = $archive->measure();
-
-			if ( is_wp_error( $measured ) ) {
-				return $measured;
-			}
-
-			FW_SM_State::log(
-				sprintf(
-					/* translators: 1: number of files, 2: formatted byte size. */
-					__( 'Archive holds %1$d files, %2$s unpacked.', 'fw' ),
-					$measured['entries'],
-					size_format( $measured['bytes'] )
-				)
-			);
-
-			FW_SM_State::set_cursor( [ 'extract_total' => $measured['entries'] ] );
-
-			return $this->mark_initialized( $index, $measured['bytes'] );
-		}
-
-		if ( FW_SM_Stage::DATABASE === $stage ) {
-			$dump = $this->import_work_dir( $state ) . '/database.sql';
-
-			$bytes = file_exists( $dump ) ? (int) filesize( $dump ) : 0;
-
-			return $this->mark_initialized( $index, $bytes );
-		}
-
-		// File stages: scan the extracted tree and enqueue a copy job per file.
-		$source = $this->import_work_dir( $state ) . '/' . FW_SM_Stage::archive_dir( $stage );
-
-		if ( ! is_dir( $source ) ) {
-			return $this->mark_initialized( $index, 0 );
-		}
-
-		// No exclusions on the way back in — the archive already holds exactly
-		// what the export decided to keep, and second-guessing it here would
-		// silently drop files the user asked for.
-		$scanner = new FW_SM_File_Scanner( $stage, $source, [] );
-
-		$stack_key = 'scan_stack_' . $stage;
-		$bytes_key = 'scan_bytes_' . $stage;
-
-		$stack = FW_SM_State::cursor( $stack_key, [ '' ] );
-		$bytes = (int) FW_SM_State::cursor( $bytes_key, 0 );
-
-		$result = $scanner->scan_slice( (array) $stack, 0 );
-
-		$bytes += $result['bytes_found'];
-
-		if ( $result['done'] ) {
-			FW_SM_State::set_cursor( [ $stack_key => [], $bytes_key => $bytes ] );
-
-			return $this->mark_initialized( $index, $bytes );
-		}
-
-		FW_SM_State::set_cursor( [ $stack_key => $result['stack'], $bytes_key => $bytes ] );
-
-		return true;
-	}
-
-	/**
-	 * Process an import stage.
-	 *
-	 * @param string $stage
-	 * @param array  $state
-	 *
-	 * @return array|WP_Error
-	 */
-	private function process_import_stage( $stage, $state ) {
-		if ( FW_SM_Stage::EXTRACT === $stage ) {
-			return $this->process_extract( $state );
-		}
-
-		if ( FW_SM_Stage::DATABASE === $stage ) {
-			return $this->process_import_database( $state );
-		}
-
-		return $this->process_import_files( $stage, $state );
-	}
-
-	/**
-	 * Unpack a slice of the archive.
-	 *
-	 * @param array $state
-	 *
-	 * @return array|WP_Error
-	 */
-	private function process_extract( $state ) {
-		$archive = new FW_SM_Archive( $state['options']['archive_path'] );
-
-		$offset = (int) FW_SM_State::cursor( 'extract_offset', 0 );
-
-		$result = $archive->extract_slice( $this->import_work_dir( $state ), $offset, 300 );
-
-		if ( is_wp_error( $result ) ) {
-			return $result;
-		}
-
-		FW_SM_State::set_cursor( [ 'extract_offset' => $result['offset'] ] );
-
-		if ( $result['skipped'] > 0 ) {
-			FW_SM_State::log(
-				sprintf(
-					/* translators: %d: number of entries. */
-					_n(
-						'Skipped %d archive entry with an unsafe or unreadable path.',
-						'Skipped %d archive entries with unsafe or unreadable paths.',
-						$result['skipped'],
-						'fw'
-					),
-					$result['skipped']
-				)
-			);
-		}
-
-		if ( $result['done'] ) {
-			FW_SM_State::log( __( 'Archive unpacked.', 'fw' ) );
-		}
-
-		return [ 'processed_bytes' => $result['bytes'], 'complete' => ! empty( $result['done'] ) ];
-	}
-
-	/**
-	 * Load a slice of the dump into the staging tables.
-	 *
-	 * @param array $state
-	 *
-	 * @return array|WP_Error
-	 */
-	private function process_import_database( $state ) {
-		$dump = $this->import_work_dir( $state ) . '/database.sql';
-
-		if ( ! file_exists( $dump ) ) {
-			return new WP_Error(
-				'fw_sm_no_dump',
-				__( 'The archive contains no database dump, so there is nothing to import.', 'fw' )
-			);
-		}
-
-		$importer = new FW_SM_Importer( $dump );
-
-		$offset = (int) FW_SM_State::cursor( 'import_offset', 0 );
-
-		$result = $importer->run_slice( $offset );
-
-		if ( is_wp_error( $result ) ) {
-			return $result;
-		}
-
-		// Table names and deferred constraints accumulate across slices; finalize
-		// needs the complete set to do the swap.
-		$tables   = array_values( array_unique( array_merge( (array) FW_SM_State::cursor( 'import_tables', [] ), $result['tables'] ) ) );
-		$deferred = array_merge( (array) FW_SM_State::cursor( 'import_deferred', [] ), $result['deferred'] );
-
-		FW_SM_State::set_cursor(
-			[
-				'import_offset'   => $result['offset'],
-				'import_tables'   => $tables,
-				'import_deferred' => $deferred,
-			]
-		);
-
-		$processed = max( 0, $result['offset'] - $offset );
-
-		if ( $result['done'] ) {
-			FW_SM_State::log(
-				sprintf(
-					/* translators: %d: number of database tables. */
-					_n(
-						'Loaded %d table into staging.',
-						'Loaded %d tables into staging.',
-						count( $tables ),
-						'fw'
-					),
-					count( $tables )
-				)
-			);
-		}
-
-		return [ 'processed_bytes' => $processed, 'complete' => ! empty( $result['done'] ) ];
-	}
-
-	/**
-	 * Copy a batch of extracted files into place.
-	 *
-	 * @param string $stage
-	 * @param array  $state
-	 *
-	 * @return array|WP_Error
-	 */
-	private function process_import_files( $stage, $state ) {
-		$jobs = FW_SM_Queue::peek( 200 );
-
-		$destination_root = FW_SM_Stage::source_dir( $stage );
-
-		if ( null === $destination_root ) {
-			// mu-plugins may not exist on the destination yet; create it rather
-			// than silently dropping the stage's files.
-			$destination_root = $this->fallback_destination( $stage );
-
-			if ( null === $destination_root || ! wp_mkdir_p( $destination_root ) ) {
-				return new WP_Error(
-					'fw_sm_no_destination',
-					sprintf(
-						/* translators: %s: stage label. */
-						__( 'There is nowhere to restore %s to on this install.', 'fw' ),
-						FW_SM_Stage::label( $stage )
-					)
-				);
-			}
-		}
-
-		$copied  = 0;
-		$bytes   = 0;
-		$skipped = 0;
-
-		foreach ( $jobs as $job ) {
-			if ( $stage !== $job['stage'] ) {
-				break;
-			}
-
-			$source = $job['payload']['absolute'] ?? '';
-			$target = trailingslashit( $destination_root ) . ( $job['payload']['path'] ?? '' );
-
-			FW_SM_Queue::delete( $job['id'] );
-
-			if ( '' === $source || ! is_readable( $source ) ) {
-				$skipped++;
-				continue;
-			}
-
-			if ( ! wp_mkdir_p( dirname( $target ) ) ) {
-				$skipped++;
-				continue;
-			}
-
-			if ( @copy( $source, $target ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
-				$copied++;
-				$bytes += (int) @filesize( $target ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
-			} else {
-				// One unwritable file should not end a restore that is otherwise
-				// fine — a read-only plugin directory is common on managed hosts.
-				$skipped++;
-			}
-		}
-
-		if ( empty( $jobs ) || 0 === $copied + $skipped ) {
-			FW_SM_State::log(
-				sprintf(
-					/* translators: %s: stage label. */
-					__( '%s restored.', 'fw' ),
-					FW_SM_Stage::label( $stage )
-				)
-			);
-
-			return [ 'processed_bytes' => 0, 'complete' => true ];
-		}
-
-		if ( $skipped > 0 ) {
-			FW_SM_State::log(
-				sprintf(
-					/* translators: 1: number of files, 2: stage label. */
-					__( 'Could not write %1$d file(s) in %2$s — continuing.', 'fw' ),
-					$skipped,
-					FW_SM_Stage::label( $stage )
-				)
-			);
-		}
-
-		return [ 'processed_bytes' => $bytes, 'complete' => false ];
-	}
-
-	/**
-	 * Where a file stage restores to when the directory does not exist yet.
-	 *
-	 * @param string $stage
-	 *
-	 * @return string|null
-	 */
-	private function fallback_destination( $stage ) {
-		switch ( $stage ) {
-			case FW_SM_Stage::MUPLUGINS:
-				return defined( 'WPMU_PLUGIN_DIR' )
-					? wp_normalize_path( WPMU_PLUGIN_DIR )
-					: wp_normalize_path( WP_CONTENT_DIR . '/mu-plugins' );
-			default:
-				return null;
-		}
-	}
-
-	/**
-	 * The working directory an import unpacks into.
-	 *
-	 * @param array $state
-	 *
-	 * @return string
-	 */
-	private function import_work_dir( $state ) {
-		return ( $state['options']['archive_path'] ?? '' ) . '-work';
-	}
 
 	/**
 	 * Close out the migration.
@@ -1086,18 +647,85 @@ class FW_SM_Runner {
 	 * @return array|WP_Error
 	 */
 	private function process_finalize( $state ) {
-		if ( 'import' === $state['direction'] ) {
-			return $this->finalize_import( $state );
+		$sender = FW_SM_Sender::from_stored();
+
+		if ( is_wp_error( $sender ) ) {
+			return $sender;
 		}
 
-		if ( 'export' === $state['direction'] ) {
-			$archive = new FW_SM_Archive( $state['options']['archive_path'] );
+		FW_SM_State::log( __( 'Asking the destination to put the migration live…', 'fw' ) );
+
+		$result = $sender->finalize();
+
+		if ( is_wp_error( $result ) ) {
+			return $result;
+		}
+
+		FW_SM_State::log(
+			sprintf(
+				/* translators: 1: number of tables, 2: number of files. */
+				__( 'Destination updated — %1$d tables and %2$d files.', 'fw' ),
+				(int) ( $result['swapped'] ?? 0 ),
+				(int) ( $result['files'] ?? 0 )
+			)
+		);
+
+		// "Finished" is not the same as "works". The destination reports back
+		// what it can actually READ, because every failure mode that survives
+		// to this point is silent by nature.
+		$verify = (array) ( $result['verify'] ?? [] );
+
+		if ( ! empty( $verify ) ) {
+			if ( empty( $verify['settings_ok'] ) ) {
+				FW_SM_State::log(
+					sprintf(
+						/* translators: %s: theme id resolved on the destination. */
+						__( 'Warning: the destination cannot read its Theme Settings. It resolved the theme id "%s" and found no readable settings under it, so the site will show defaults. Usually the theme files did not all arrive — check that the parent theme is complete on the destination, then migrate again.', 'fw' ),
+						$verify['theme_id'] ? $verify['theme_id'] : __( 'unknown', 'fw' )
+					)
+				);
+			} else {
+				FW_SM_State::log(
+					sprintf(
+						/* translators: 1: theme id, 2: size. */
+						__( 'Theme Settings verified on the destination — theme id "%1$s", %2$s readable.', 'fw' ),
+						$verify['theme_id'],
+						size_format( (int) $verify['settings_bytes'] )
+					)
+				);
+			}
+
+			if ( ! empty( $verify['unreadable'] ) ) {
+				FW_SM_State::log(
+					sprintf(
+						/* translators: 1: count, 2: example option names. */
+						__( 'Warning: %1$d option(s) on the destination are no longer readable and will fall back to defaults. For example: %2$s', 'fw' ),
+						(int) $verify['unreadable'],
+						implode( ', ', (array) ( $verify['unreadable_eg'] ?? [] ) )
+					)
+				);
+			}
+		}
+
+		// Deleting files on someone else's live server is not something to do
+		// quietly, so it is always named — with examples, since "removed 41
+		// files" on its own is not something anyone can check.
+		$pruned = (int) ( $result['pruned'] ?? 0 );
+
+		if ( $pruned > 0 ) {
+			$paths = (array) ( $result['pruned_paths'] ?? [] );
 
 			FW_SM_State::log(
 				sprintf(
-					/* translators: %s: formatted file size. */
-					__( 'Archive complete — %s.', 'fw' ),
-					size_format( $archive->size() )
+					/* translators: 1: file count, 2: a few example paths. */
+					_n(
+						'Removed %1$d file from the destination that no longer exists here: %2$s',
+						'Removed %1$d files from the destination that no longer exist here. For example: %2$s',
+						$pruned,
+						'fw'
+					),
+					$pruned,
+					implode( ', ', array_slice( $paths, 0, 5 ) )
 				)
 			);
 		}
@@ -1106,125 +734,634 @@ class FW_SM_Runner {
 	}
 
 	/**
-	 * Put an import live.
+	 * Export a slice of a table straight to the destination.
 	 *
-	 * This is the only moment the destination's own data is replaced, and the
-	 * order matters. The carve-out is captured BEFORE the swap, because after it
-	 * the options table is the archive's, not this site's — read it any later and
-	 * you are preserving the source's values, which defeats the point.
+	 * No file is written on the way. The exporter builds SQL into a string, the
+	 * sender posts it, and the destination loads it into staging tables — so the
+	 * source never needs disk space for a copy of its own database, which it may
+	 * well not have.
 	 *
 	 * @param array $state
 	 *
 	 * @return array|WP_Error
 	 */
-	private function finalize_import( $state ) {
-		$tables = (array) FW_SM_State::cursor( 'import_tables', [] );
+	private function push_database( $state ) {
+		$sender = FW_SM_Sender::from_stored();
 
-		if ( empty( $tables ) ) {
-			return new WP_Error(
-				'fw_sm_import_no_tables',
-				__( 'The import loaded no tables, so nothing was put live.', 'fw' )
-			);
+		if ( is_wp_error( $sender ) ) {
+			return $sender;
 		}
 
-		$dump     = $this->import_work_dir( $state ) . '/database.sql';
-		$importer = new FW_SM_Importer( $dump );
+		$jobs = FW_SM_Queue::peek( 1 );
+		$job  = null;
 
-		// Capture first — see the note above.
-		$preserved = FW_SM_Importer::capture_preserved();
-
-		FW_SM_State::log( __( 'Putting the imported database live…', 'fw' ) );
-
-		$swapped = $importer->swap_into_place( $tables );
-
-		if ( is_wp_error( $swapped ) ) {
-			// The swap failed, so the destination is untouched. Clear the staging
-			// tables rather than leaving a half-set behind.
-			FW_SM_Importer::drop_staging_tables();
-
-			return $swapped;
+		foreach ( $jobs as $candidate ) {
+			if ( FW_SM_Stage::DATABASE === $candidate['stage'] ) {
+				$job = $candidate;
+			}
 		}
 
-		// Roles and this extension's own settings come back from the destination.
-		FW_SM_Importer::restore_preserved(
-			$preserved,
-			(string) ( $state['options']['source_prefix'] ?? '' )
-		);
+		if ( null === $job ) {
+			$n = (int) FW_SM_State::cursor( 'timing_n', 0 );
 
-		$deferred = (array) FW_SM_State::cursor( 'import_deferred', [] );
+			if ( $n > 0 ) {
+				$build  = (int) FW_SM_State::cursor( 'timing_build', 0 );
+				$send   = (int) FW_SM_State::cursor( 'timing_send', 0 );
+				$remote = (int) FW_SM_State::cursor( 'timing_remote', 0 );
+				$kb     = (int) FW_SM_State::cursor( 'timing_kb', 0 );
 
-		if ( ! empty( $deferred ) ) {
-			$failed = $importer->apply_deferred_constraints( $deferred );
+				// send includes remote, so the wire is what is left over.
+				$wire = max( 0, $send - $remote );
 
-			if ( ! empty( $failed ) ) {
 				FW_SM_State::log(
 					sprintf(
-						/* translators: %d: number of constraints. */
-						_n(
-							'%d foreign key could not be recreated and was skipped.',
-							'%d foreign keys could not be recreated and were skipped.',
-							count( $failed ),
-							'fw'
-						),
-						count( $failed )
+						/* translators: 1: batches, 2: MB, 3: build seconds, 4: wire seconds, 5: destination seconds. */
+						__( 'Database sent — %1$d batches, %2$s MB of SQL. Time: %3$ss building, %4$ss on the wire, %5$ss on the destination.', 'fw' ),
+						$n,
+						number_format( $kb / 1024, 1 ),
+						number_format( $build / 1000, 1 ),
+						number_format( $wire / 1000, 1 ),
+						number_format( $remote / 1000, 1 )
+					)
+				);
+			} else {
+				FW_SM_State::log( __( 'Database sent.', 'fw' ) );
+			}
+
+			return [ 'processed_bytes' => 0, 'complete' => true ];
+		}
+
+		$table  = $job['payload']['table'] ?? '';
+		$export = new FW_SM_DB_Export( '', $this->make_replacer( $state ), $this->db_context( $state ) );
+
+		// The destination's post_max_size governs how much SQL may be sent at
+		// once; it reported its own limits during the handshake.
+		$export->set_max_batch( self::batch_ceiling() );
+
+		// Per-phase timing. Guessing at which part of a migration is slow has
+		// cost more time in this project than any actual bug, so each batch
+		// records where its seconds went.
+		$t_build = microtime( true );
+
+		$sql = '';
+
+		// First slice for this table: send its structure before its rows.
+		//
+		// The cursor is NOT written here. Recording the table as started before
+		// the batch has landed means a failed send loses the CREATE TABLE while
+		// keeping the note that it was sent — so every retry ships INSERTs for
+		// a table the destination was never told to create, and the migration
+		// dies on "table doesn't exist" rather than on the original error.
+		$started = FW_SM_State::cursor( 'db_table' ) === $table;
+		$key_col = $started
+			? (string) FW_SM_State::cursor( 'db_key_col', '' )
+			: FW_SM_DB_Export::primary_key( $table );
+
+		if ( ! $started ) {
+			$schema = $export->build_schema( $table );
+
+			if ( is_wp_error( $schema ) ) {
+				return $schema;
+			}
+
+			$sql .= $schema;
+		}
+
+		$rows = $export->build_rows(
+			$table,
+			$key_col,
+			$started ? FW_SM_State::cursor( 'db_last_key', '' ) : '',
+			$started ? (int) FW_SM_State::cursor( 'db_offset', 0 ) : 0
+		);
+
+		if ( is_wp_error( $rows ) ) {
+			return $rows;
+		}
+
+		$sql .= $rows['sql'];
+
+		$build_ms = (int) round( ( microtime( true ) - $t_build ) * 1000 );
+		$sql_kb   = (int) round( strlen( $sql ) / 1024 );
+
+		if ( '' !== trim( $sql ) ) {
+			$t_send = microtime( true );
+
+			$sent = $sender->send_sql( $sql );
+
+			$send_ms = (int) round( ( microtime( true ) - $t_send ) * 1000 );
+
+			if ( is_wp_error( $sent ) ) {
+				$retry = $this->maybe_retry_job( $job, $sent );
+
+				if ( is_wp_error( $retry ) ) {
+					return $retry;
+				}
+
+				// Retryable: leave the cursor where it is and come back to it.
+				return [ 'processed_bytes' => 0, 'complete' => false ];
+			}
+		}
+
+		// One line per table, updated as it goes, rather than one per batch —
+		// a log with a thousand timing lines in it is not a log anyone reads.
+		if ( isset( $send_ms ) ) {
+			$remote_ms = (int) ( $sent['remote_ms'] ?? 0 );
+
+			// Reported every few batches rather than only at the end of the
+			// stage, because a stage that is slow is exactly the one you never
+			// get to see the end of.
+			$n_before = (int) FW_SM_State::cursor( 'timing_n', 0 );
+
+			if ( $n_before > 0 && 0 === ( $n_before % 5 ) ) {
+				$b = (int) FW_SM_State::cursor( 'timing_build', 0 );
+				$w = max( 0, (int) FW_SM_State::cursor( 'timing_send', 0 ) - (int) FW_SM_State::cursor( 'timing_remote', 0 ) );
+				$d = (int) FW_SM_State::cursor( 'timing_remote', 0 );
+				$k = (int) FW_SM_State::cursor( 'timing_kb', 0 );
+
+				FW_SM_State::log(
+					sprintf(
+						/* translators: 1: batches, 2: MB, 3-5: seconds. */
+						__( '%1$d batches, %2$s MB — %3$ss building, %4$ss wire, %5$ss destination.', 'fw' ),
+						$n_before,
+						number_format( $k / 1024, 1 ),
+						number_format( $b / 1000, 1 ),
+						number_format( $w / 1000, 1 ),
+						number_format( $d / 1000, 1 )
 					)
 				);
 			}
+
+			FW_SM_State::set_cursor(
+				[
+					'timing_table'  => $table,
+					'timing_build'  => (int) FW_SM_State::cursor( 'timing_build', 0 ) + $build_ms,
+					'timing_send'   => (int) FW_SM_State::cursor( 'timing_send', 0 ) + $send_ms,
+					'timing_remote' => (int) FW_SM_State::cursor( 'timing_remote', 0 ) + $remote_ms,
+					'timing_kb'     => (int) FW_SM_State::cursor( 'timing_kb', 0 ) + $sql_kb,
+					'timing_n'      => (int) FW_SM_State::cursor( 'timing_n', 0 ) + 1,
+				]
+			);
 		}
 
-		// Only now are the displaced originals expendable.
-		$importer->drop_displaced( $tables );
+		// Only now that the destination has taken it. Everything the retry
+		// would need to rebuild this exact batch is left untouched until here.
+		FW_SM_State::set_cursor(
+			[
+				'db_table'    => $table,
+				'db_key_col'  => $key_col,
+				'db_last_key' => $rows['last_key'],
+				'db_offset'   => $rows['offset'],
+			]
+		);
 
-		$this->delete_work_dir( $state );
+		$total_rows = max( 1, (int) ( $job['payload']['rows'] ?? 1 ) );
 
-		// Object caches and rewrite rules both describe a database that no longer
-		// exists; leaving them would serve the old site from cache.
-		wp_cache_flush();
-		flush_rewrite_rules( false );
+		$processed = (int) min(
+			$job['bytes'],
+			floor( $job['bytes'] / $total_rows ) * $rows['rows_written']
+		);
 
-		FW_SM_State::log( __( 'Import complete. Log in again if your session ends.', 'fw' ) );
+		if ( $rows['done'] ) {
+			FW_SM_Queue::delete( $job['id'] );
+			FW_SM_State::set_cursor( [ 'db_table' => '' ] );
+		}
 
-		return [ 'processed_bytes' => 0, 'complete' => true ];
+		return [ 'processed_bytes' => $processed, 'complete' => false ];
 	}
 
 	/**
-	 * Remove an import's working directory.
+	 * Send files to the destination.
 	 *
-	 * @param array $state
+	 * One request per file. That is slower than bundling, and it is the right
+	 * trade for a first version: a failure is attributable to a single file, a
+	 * retry costs a single file, and there is no payload-framing format to get
+	 * subtly wrong. Bundling is the obvious optimisation once this is proven.
 	 *
-	 * @return void
+	 * @param string $stage
+	 * @param array  $state
+	 *
+	 * @return array|WP_Error
 	 */
-	private function delete_work_dir( $state ) {
-		$dir = $this->import_work_dir( $state );
+	private function push_files( $stage, $state ) {
+		$sender = FW_SM_Sender::from_stored();
 
-		if ( '' === $dir || ! is_dir( $dir ) ) {
-			return;
+		if ( is_wp_error( $sender ) ) {
+			return $sender;
 		}
 
-		$iterator = new RecursiveIteratorIterator(
-			new RecursiveDirectoryIterator( $dir, FilesystemIterator::SKIP_DOTS ),
-			RecursiveIteratorIterator::CHILD_FIRST
-		);
+		// Enough jobs to fill a bundle. A wp-content tree is mostly small files,
+		// so peeking 25 at a time would cap a bundle far below its useful size.
+		$jobs = FW_SM_Queue::peek( FW_SM_Sender::BUNDLE_FILES );
 
-		foreach ( $iterator as $item ) {
-			if ( $item->isDir() ) {
-				@rmdir( $item->getPathname() ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
-			} else {
-				@unlink( $item->getPathname() ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
+		$bytes   = 0;
+		$sent    = 0;
+		$skipped = 0;
+
+		// Quick migration: ask the destination which of these it already has,
+		// byte-for-byte, and drop the rest from the queue without sending them.
+		// On a repeat push almost everything is unchanged — plugins, themes,
+		// existing uploads — so this is the difference between minutes and
+		// hours, and the end state is identical either way.
+		if ( ! empty( $state['options']['quick'] ) ) {
+			$already = $this->drop_files_already_there( $sender, $stage, $jobs );
+
+			if ( is_wp_error( $already ) ) {
+				return $already;
+			}
+
+			if ( $already['dropped'] > 0 ) {
+				$bytes  += $already['bytes'];
+				$skipped += $already['dropped'];
+				$jobs    = $already['remaining'];
 			}
 		}
 
-		@rmdir( $dir ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
+		// Small files go together in one request; large ones keep the chunked
+		// path, where the cost is already the bytes rather than the round trip.
+		// Gather as many bundles as it is worth sending at once. One connection
+		// over a long round trip is limited by its window rather than by the
+		// link, so filling several at the same time is the difference between
+		// a link that is busy and one that spends most of its time waiting.
+		$streams = self::stream_count();
+
+		$bundles     = [];
+		$bundle_ids  = [];
+		$bundle      = [];
+		$ids         = [];
+		$bundle_raw  = 0;
+
+		foreach ( $jobs as $job ) {
+			if ( $stage !== $job['stage'] ) {
+				break;
+			}
+
+			$absolute = $job['payload']['absolute'] ?? '';
+			$relative = $job['payload']['path'] ?? '';
+
+			if ( '' === $absolute || ! is_readable( $absolute ) ) {
+				// Vanished between the scan and now — a cache purge, a plugin
+				// update. Ordinary on a live site.
+				FW_SM_Queue::delete( $job['id'] );
+				$skipped++;
+				continue;
+			}
+
+			if ( (int) $job['bytes'] >= FW_SM_Sender::BUNDLE_FILE_MAX ) {
+				// A large file ends the gathering: send whatever is collected
+				// first, so the two paths never interleave within one pass.
+				break;
+			}
+
+			$bundle[]    = [ 'path' => $relative, 'absolute' => $absolute ];
+			$ids[]       = $job['id'];
+			$bundle_raw += (int) $job['bytes'];
+
+			if ( $bundle_raw >= FW_SM_Sender::BUNDLE_BYTES
+			     || count( $bundle ) >= FW_SM_Sender::BUNDLE_FILES ) {
+				$bundles[]    = $bundle;
+				$bundle_ids[] = $ids;
+
+				$bundle     = [];
+				$ids        = [];
+				$bundle_raw = 0;
+
+				if ( count( $bundles ) >= $streams ) {
+					break;
+				}
+			}
+		}
+
+		// Whatever is left over is a bundle too, unless there is already a full
+		// set — a part-filled request still costs a whole round trip.
+		if ( ! empty( $bundle ) && count( $bundles ) < $streams ) {
+			$bundles[]    = $bundle;
+			$bundle_ids[] = $ids;
+		}
+
+		if ( ! empty( $bundles ) ) {
+			$results = count( $bundles ) > 1
+				? $sender->send_bundles( $stage, $bundles )
+				: [ $sender->send_bundle( $stage, $bundles[0] ) ];
+
+			$failure     = null;
+			$failed_first = 0;
+
+			foreach ( $bundles as $i => $group ) {
+				$result = $results[ $i ] ?? null;
+
+				if ( null === $result || is_wp_error( $result ) ) {
+					// One bundle failing does not undo the others: they landed,
+					// and re-sending them would be pure waste. Their jobs are
+					// still cleared below; only the failed one is left in the
+					// queue to be retried.
+					if ( null === $failure ) {
+						$failure = $result ?: new WP_Error(
+							'fw_sm_transport',
+							__( 'No response.', 'fw' ),
+							[ 'retryable' => true ]
+						);
+
+						// Must be a job from the bundle that actually failed.
+						// The successful bundles' jobs are deleted below, and a
+						// retry counter attached to one of those would be
+						// counting against a job that no longer exists.
+						$failed_first = $bundle_ids[ $i ][0];
+					}
+
+					continue;
+				}
+
+				// The sender may have packed fewer than offered, once the byte
+				// cap was reached. Only those are done.
+				$done = (int) ( $result['sent_files'] ?? count( $group ) );
+
+				for ( $j = 0; $j < $done; $j++ ) {
+					FW_SM_Queue::delete( $bundle_ids[ $i ][ $j ] );
+				}
+
+				$bytes += (int) ( $result['bytes'] ?? 0 );
+				$sent  += (int) ( $result['written'] ?? 0 );
+
+				if ( ! empty( $result['skipped'] ) ) {
+					$skipped += (int) $result['skipped'];
+				}
+			}
+
+			if ( null !== $failure ) {
+				// Attributed to a job that is still queued, so the retry
+				// counter has somewhere to live.
+				$retry = $this->maybe_retry_job( [ 'id' => $failed_first, 'bytes' => 0 ], $failure );
+
+				if ( is_wp_error( $retry ) ) {
+					return $retry;
+				}
+			}
+
+			return [ 'processed_bytes' => $bytes, 'complete' => false ];
+		}
+
+		// Nothing small to bundle: the head of the queue is a large file.
+		foreach ( $jobs as $job ) {
+			if ( $stage !== $job['stage'] ) {
+				break;
+			}
+
+			if ( ! $this->has_budget() ) {
+				break;
+			}
+
+			$absolute = $job['payload']['absolute'] ?? '';
+			$relative = $job['payload']['path'] ?? '';
+
+			if ( '' === $absolute || ! is_readable( $absolute ) ) {
+				FW_SM_Queue::delete( $job['id'] );
+				$skipped++;
+				continue;
+			}
+
+			$offset_key = 'file_offset_' . $job['id'];
+			$offset     = (int) FW_SM_State::cursor( $offset_key, 0 );
+
+			$result = $sender->send_file( $stage, $relative, $absolute, $offset );
+
+			if ( is_wp_error( $result ) ) {
+				$retry = $this->maybe_retry_job( $job, $result );
+
+				if ( is_wp_error( $retry ) ) {
+					return $retry;
+				}
+
+				return [ 'processed_bytes' => $bytes, 'complete' => false ];
+			}
+
+			$bytes += (int) ( $result['sent_bytes'] ?? 0 );
+
+			if ( empty( $result['done'] ) || ! empty( $result['resync'] ) ) {
+				$next = isset( $result['at'] )
+					? (int) $result['at']
+					: (int) $result['next_offset'];
+
+				FW_SM_State::set_cursor( [ $offset_key => $next ] );
+
+				return [ 'processed_bytes' => $bytes, 'complete' => false ];
+			}
+
+			FW_SM_Queue::delete( $job['id'] );
+			FW_SM_State::set_cursor( [ $offset_key => null ] );
+
+			$sent++;
+
+			// One large file per pass keeps the slice bounded.
+			break;
+		}
+
+		if ( 0 === $sent + $skipped ) {
+			$unchanged = (int) FW_SM_State::cursor( 'unchanged_' . $stage, 0 );
+
+			FW_SM_State::log(
+				$unchanged > 0
+					? sprintf(
+						/* translators: 1: stage label, 2: number of files. */
+						__( '%1$s sent — %2$d file(s) were already up to date.', 'fw' ),
+						FW_SM_Stage::label( $stage ),
+						$unchanged
+					)
+					: sprintf(
+						/* translators: %s: stage label. */
+						__( '%s sent.', 'fw' ),
+						FW_SM_Stage::label( $stage )
+					)
+			);
+
+			return [ 'processed_bytes' => 0, 'complete' => true ];
+		}
+
+		if ( $skipped > 0 ) {
+			FW_SM_State::set_cursor(
+				[ 'unchanged_' . $stage => (int) FW_SM_State::cursor( 'unchanged_' . $stage, 0 ) + $skipped ]
+			);
+		}
+
+		return [ 'processed_bytes' => $bytes, 'complete' => false ];
 	}
 
 	/**
-	 * Build an exporter bound to this migration's dump file and replacer.
+	 * Remove from the queue any file the destination already has identically.
+	 *
+	 * One extra request per batch buys skipping the transfer of every unchanged
+	 * file in it, which on a second push is nearly all of them.
+	 *
+	 * Their bytes still count toward progress: the work of getting that file to
+	 * the destination IS done, and a progress bar that only advanced for files
+	 * that happened to have changed would sit at 4% through a successful
+	 * migration.
+	 *
+	 * @param FW_SM_Sender $sender
+	 * @param string       $stage
+	 * @param array[]      $jobs
+	 *
+	 * @return array|WP_Error [ 'dropped', 'bytes', 'remaining' ]
+	 */
+	private function drop_files_already_there( $sender, $stage, array $jobs ) {
+		$manifest = [];
+		$index_of = [];
+
+		foreach ( $jobs as $i => $job ) {
+			if ( $stage !== $job['stage'] ) {
+				continue;
+			}
+
+			$absolute = $job['payload']['absolute'] ?? '';
+
+			if ( '' === $absolute || ! is_readable( $absolute ) ) {
+				continue;
+			}
+
+			$index_of[ count( $manifest ) ] = $i;
+
+			$manifest[] = [
+				'path'  => $job['payload']['path'] ?? '',
+				'size'  => (int) @filesize( $absolute ), // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+				'mtime' => (int) @filemtime( $absolute ), // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+			];
+		}
+
+		if ( empty( $manifest ) ) {
+			return [ 'dropped' => 0, 'bytes' => 0, 'remaining' => $jobs ];
+		}
+
+		$answer = $sender->which_needed( $stage, $manifest );
+
+		if ( is_wp_error( $answer ) ) {
+			// If the destination cannot answer, send everything. Slower, never
+			// wrong — which is the right way round for a failure here.
+			return [ 'dropped' => 0, 'bytes' => 0, 'remaining' => $jobs ];
+		}
+
+		$needed = array_flip( array_map( 'intval', (array) ( $answer['needed'] ?? [] ) ) );
+
+		$dropped = 0;
+		$bytes   = 0;
+
+		foreach ( $index_of as $manifest_index => $job_index ) {
+			if ( isset( $needed[ $manifest_index ] ) ) {
+				continue;
+			}
+
+			$job = $jobs[ $job_index ];
+
+			FW_SM_Queue::delete( $job['id'] );
+
+			$bytes += (int) $job['bytes'];
+			$dropped++;
+
+			unset( $jobs[ $job_index ] );
+		}
+
+		return [
+			'dropped'   => $dropped,
+			'bytes'     => $bytes,
+			'remaining' => array_values( $jobs ),
+		];
+	}
+
+	/**
+	 * Decide whether a failed job gets another go.
+	 *
+	 * @param array    $job
+	 * @param WP_Error $error
+	 *
+	 * @return true|WP_Error True to retry, the error itself to give up.
+	 */
+	private function maybe_retry_job( $job, WP_Error $error ) {
+		$data = $error->get_error_data();
+
+		// Retrying an identical request that ran the destination out of memory
+		// will run it out of memory again, three times, and then give up — which
+		// is what used to happen. The size is the thing that has to change, so
+		// each attempt halves it and the next one carries less.
+		//
+		// This is also the only mechanism that can find a workable size on a
+		// destination we cannot measure directly: the connection test learns a
+		// ceiling from payloads it survives, but a batch can still be too big
+		// for what the IMPORT of it costs, which is several times the bytes on
+		// the wire.
+		if ( self::is_capacity_error( $error ) ) {
+			$before = self::batch_ceiling();
+			$after  = max( self::MIN_BATCH_BYTES, (int) ( $before / 2 ) );
+
+			if ( $after < $before ) {
+				FW_SM_State::set_cursor( [ 'batch_ceiling' => $after ] );
+
+				// A smaller batch is a different request, so it starts with a
+				// clean slate. Without this the three attempts are spent on the
+				// way down and it gives up just as the size becomes workable.
+				// The floor above is what stops this looping forever: once
+				// batches cannot shrink further, attempts accumulate normally.
+				FW_SM_Queue::reset_attempts( $job['id'] );
+
+				FW_SM_State::log(
+					sprintf(
+						/* translators: 1: previous size, 2: new size. */
+						__( 'The destination ran out of memory. Retrying with smaller batches — %1$s down to %2$s.', 'fw' ),
+						size_format( $before ),
+						size_format( $after )
+					)
+				);
+
+				// Said once, above. Falling through would add a second line
+				// claiming an attempt number that the reset just invalidated,
+				// which is how the log came to read "attempt 2" three times in
+				// a row while the size was in fact changing each time.
+				return true;
+			}
+		}
+
+		// A checksum failure means the destination threw the partial file away,
+		// so the next attempt has to start at byte zero rather than resuming
+		// into a file that no longer exists.
+		if ( false !== strpos( $error->get_error_message(), 'checksum' ) ) {
+			FW_SM_State::set_cursor( [ 'file_offset_' . $job['id'] => 0 ] );
+		}
+
+		if ( empty( $data['retryable'] ) ) {
+			return $error;
+		}
+
+		$attempts = FW_SM_Queue::bump_attempts( $job['id'] );
+
+		if ( $attempts >= self::MAX_ATTEMPTS ) {
+			return new WP_Error(
+				$error->get_error_code(),
+				sprintf(
+					/* translators: 1: attempt count, 2: underlying error. */
+					__( 'Gave up after %1$d attempts: %2$s', 'fw' ),
+					$attempts,
+					$error->get_error_message()
+				)
+			);
+		}
+
+		FW_SM_State::log(
+			sprintf(
+				/* translators: 1: attempt number, 2: error message. */
+				__( 'Retrying (attempt %1$d) — %2$s', 'fw' ),
+				$attempts + 1,
+				$error->get_error_message()
+			)
+		);
+
+		return true;
+	}
+
+	/**
+	 * The replacer for this migration: source URL and path to destination.
 	 *
 	 * @param array $state
 	 *
-	 * @return FW_SM_DB_Export
+	 * @return FW_SM_Replacer
 	 */
-	private function make_exporter( $state ) {
+	private function make_replacer( $state ) {
 		$options = (array) $state['options'];
 
 		$replacer = FW_SM_Replacer::for_site_move(
@@ -1234,31 +1371,191 @@ class FW_SM_Runner {
 			$options['target_path'] ?? ''
 		);
 
-		return new FW_SM_DB_Export( $this->dump_path( $state ), $replacer );
-	}
+		// Promoting a subsite moves its uploads out of /uploads/sites/<id>/, and
+		// folding one in does the reverse. Every attachment URL and every
+		// serialized reference to that path has to follow.
+		$extra = FW_SM_Multisite::extra_replace_pairs(
+			$options['mode'] ?? FW_SM_Multisite::MODE_SINGLE,
+			(int) ( $options['source_blog_id'] ?? 0 ),
+			(int) ( $options['dest_blog_id'] ?? 0 )
+		);
 
-	/**
-	 * Working path of the .sql file, alongside the archive.
-	 *
-	 * @param array $state
-	 *
-	 * @return string
-	 */
-	private function dump_path( $state ) {
-		return ( $state['options']['archive_path'] ?? '' ) . '.sql';
-	}
-
-	/**
-	 * @param array $state
-	 *
-	 * @return void
-	 */
-	private function delete_working_dump( $state ) {
-		$path = $this->dump_path( $state );
-
-		if ( '' !== $path && file_exists( $path ) ) {
-			@unlink( $path ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
+		foreach ( $extra as $pair ) {
+			$replacer->add_pair( $pair['search'], $pair['replace'], ! empty( $pair['ci'] ) );
 		}
+
+		return $replacer;
+	}
+
+	/**
+	 * Did this failure mean the destination could not cope with the size?
+	 *
+	 * Deliberately narrow. A refusal, a bad signature, or a missing table are
+	 * all permanent and shrinking the batch would only make the migration take
+	 * longer to fail. Only the shapes that a smaller request could plausibly
+	 * fix count.
+	 *
+	 * @param WP_Error $error
+	 *
+	 * @return bool
+	 */
+	private static function is_capacity_error( WP_Error $error ) {
+		$message = strtolower( $error->get_error_message() );
+
+		foreach ( [ 'allowed memory size', 'memory exhausted', 'max_allowed_packet', 'critical error', 'http 500' ] as $needle ) {
+			if ( false !== strpos( $message, $needle ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * The batch size in force for this migration.
+	 *
+	 * Starts from what the connection test measured and only ever comes down,
+	 * as failures reveal that the measurement was optimistic. It is held on the
+	 * migration rather than in an option so a bad destination on one migration
+	 * does not permanently shrink batches to a different one.
+	 *
+	 * @return int
+	 */
+	public static function batch_ceiling() {
+		$learned = (int) FW_SM_State::cursor( 'batch_ceiling', 0 );
+
+		return $learned > 0 ? $learned : self::safe_payload_size();
+	}
+
+	/**
+	 * How many requests to keep in flight at once.
+	 *
+	 * Measured, never assumed. The connection test sends the same payload over
+	 * one, four, and eight connections; if the link were already saturated the
+	 * throughput would not move, and opening more connections would only add
+	 * load to the destination for nothing. Concurrency is used only where it
+	 * was shown to help, and only up to the point where it stopped helping.
+	 *
+	 * @return int At least 1.
+	 */
+	public static function stream_count() {
+		$diag = get_option( 'fw_sm_diagnostic', null );
+
+		if ( ! is_array( $diag ) || empty( $diag['parallel'] ) ) {
+			return 1;
+		}
+
+		$best      = 1;
+		$best_rate = 0;
+		$base_rate = 0;
+
+		foreach ( $diag['parallel'] as $row ) {
+			if ( ! empty( $row['error'] ) || empty( $row['total_ms'] ) ) {
+				continue;
+			}
+
+			$rate    = (int) $row['sent'] / ( (int) $row['total_ms'] / 1000 );
+			$streams = (int) $row['streams'];
+
+			if ( 1 === $streams ) {
+				$base_rate = $rate;
+			}
+
+			if ( $rate > $best_rate ) {
+				$best_rate = $rate;
+				$best      = $streams;
+			}
+		}
+
+		// A margin, so ordinary run-to-run variance in the measurement does not
+		// get mistaken for a gain worth opening connections for.
+		if ( $base_rate <= 0 || $best_rate < $base_rate * 1.3 ) {
+			return 1;
+		}
+
+		return max( 1, min( 8, $best ) );
+	}
+
+	/**
+	 * The largest request this destination is known to survive.
+	 *
+	 * Prefers what the connection test actually measured over what the
+	 * destination claims it allows, because the two disagree in the direction
+	 * that matters: a host can advertise a 128 MB post_max_size and still fatal
+	 * on 8 MB.
+	 *
+	 * Compression works in our favour here — the ceiling applies to the SQL
+	 * before gzip, and SQL compresses by roughly an order of magnitude, so a
+	 * batch sized to a measured limit is comfortably inside it on the wire.
+	 *
+	 * @return int Bytes, 0 for "no information, use the default".
+	 */
+	public static function safe_payload_size() {
+		$diag = get_option( 'fw_sm_diagnostic', null );
+
+		if ( is_array( $diag ) && ! empty( $diag['safe'] ) ) {
+			// The measurement is of RAW POST bytes; this cap governs SQL BEFORE
+			// it is gzipped, and SQL compresses by roughly ten times. Treating
+			// the two as the same unit would shrink batches by an order of
+			// magnitude for no safety gain — and with latency measured at over a
+			// second per request, small batches are the expensive mistake.
+			//
+			// A factor of four assumes far worse compression than SQL actually
+			// achieves, so the payload on the wire stays well inside what the
+			// destination survived.
+			return max( 1048576, min( FW_SM_DB_Export::MAX_BATCH_BYTES, (int) $diag['safe'] * 4 ) );
+		}
+
+		$stored = get_option( self::DESTINATION_OPTION_NAME, [] );
+		$info   = is_array( $stored ) ? ( $stored['info'] ?? [] ) : [];
+
+		$size = FW_SM_Sender::usable_payload( (int) ( $info['post_max_size'] ?? 0 ) );
+
+		if ( $size <= 0 ) {
+			return FW_SM_DB_Export::MAX_BATCH_BYTES;
+		}
+
+		// post_max_size is a poor proxy for what a destination can IMPORT. A
+		// host advertising 256 MB yields a 154 MB batch, which no 128 MB
+		// memory_limit can survive — and the failure is an uncatchable fatal,
+		// so it costs a round trip and a confusing error rather than a refusal.
+		//
+		// Importing costs several times the bytes on the wire: decompress,
+		// split into statements, execute. A fraction of the destination's
+		// memory is a far better bound than a fraction of what it will accept.
+		// A thirty-second, not a half. Measured rather than guessed: a
+		// destination with a 128 MB limit was observed to fatal on an 8 MB
+		// payload, so the working batch for such a host is nearer 4 MB — and
+		// 128 / 32 gives exactly that. Hosts with real memory still reach the
+		// cap (512 MB yields 16 MB, 1 GB yields the full 25 MB).
+		$memory = (int) ( $info['memory_limit'] ?? 0 );
+
+		if ( $memory > 0 ) {
+			$size = min( $size, (int) ( $memory / 32 ) );
+		}
+
+		return max( self::MIN_BATCH_BYTES, min( FW_SM_DB_Export::MAX_BATCH_BYTES, $size ) );
+	}
+
+	/**
+	 * The table mapping context for this migration.
+	 *
+	 * @param array $state
+	 *
+	 * @return array
+	 */
+	private function db_context( $state ) {
+		global $wpdb;
+
+		$options = (array) $state['options'];
+
+		return [
+			'mode'           => $options['mode'] ?? FW_SM_Multisite::MODE_SINGLE,
+			'source_prefix'  => $wpdb->base_prefix,
+			'dest_prefix'    => $options['target_prefix'] ?? $wpdb->base_prefix,
+			'source_blog_id' => (int) ( $options['source_blog_id'] ?? 1 ),
+			'dest_blog_id'   => (int) ( $options['dest_blog_id'] ?? 1 ),
+		];
 	}
 
 	/**
@@ -1280,6 +1577,27 @@ class FW_SM_Runner {
 	 */
 	private function fail( WP_Error $error ) {
 		FW_SM_State::log( $error->get_error_message() );
+
+		// Tell the destination to let go. Without this a failed migration leaves
+		// it holding a session — and refusing every later attempt — until that
+		// session ages out, which is a miserable thing to debug because the
+		// error you see next has nothing to do with the error that caused it.
+		//
+		// Best effort by design: if the destination is unreachable, that is very
+		// likely WHY we are failing, and the failure worth reporting is the
+		// original one, not this one.
+		$sender = FW_SM_Sender::from_stored();
+
+		if ( ! is_wp_error( $sender ) ) {
+			$aborted = $sender->abort();
+
+			if ( is_wp_error( $aborted ) ) {
+				FW_SM_State::log(
+					__( 'Could not tell the destination to stand down; it will release the migration on its own shortly.', 'fw' )
+				);
+			}
+		}
+
 		FW_SM_State::finish( 'failed', $error->get_error_message() );
 
 		$this->release_lock();

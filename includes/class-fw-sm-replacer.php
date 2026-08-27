@@ -75,6 +75,15 @@ class FW_SM_Replacer {
 	 *
 	 * @return void
 	 */
+	/**
+	 * Characters a root-relative URL can legitimately follow.
+	 *
+	 * Quotes and an equals sign cover HTML attributes, whitespace and a comma
+	 * cover srcset and CSS lists, the parenthesis covers url(), and the
+	 * brackets cover JSON and markup boundaries.
+	 */
+	const DELIMITERS = '[\x22\x27\s=(\[,;>]';
+	
 	public function add_pair( $search, $replace, $case_insensitive = false ) {
 		$search  = (string) $search;
 		$replace = (string) $replace;
@@ -98,6 +107,80 @@ class FW_SM_Replacer {
 				'replace' => $escaped_replace,
 				'ci'      => (bool) $case_insensitive,
 			];
+		}
+	}
+
+	/**
+	 * Add a pair that only matches a URL path where a URL actually starts.
+	 *
+	 * Root-relative URLs — src="/subdir/wp-content/..." — carry no scheme and
+	 * no host, so the ordinary URL pair never sees them and the source's
+	 * subdirectory survives into a destination that has none.
+	 *
+	 * A plain string pair cannot fix that safely in either direction:
+	 *
+	 *   - Subdirectory to root, '/subdir/wp-content' => '/wp-content' would
+	 *     also rewrite somebody else's absolute URL that happens to contain
+	 *     that path.
+	 *   - Root to subdirectory, '/wp-content' => '/subdir/wp-content' would hit
+	 *     the absolute URLs the URL pair has ALREADY rewritten, turning
+	 *     /subdir/wp-content into /subdir/subdir/wp-content. Pairs apply in
+	 *     sequence, so each one sees the previous one's output.
+	 *
+	 * What separates the two cases is the character in front. A root-relative
+	 * URL always begins right after a delimiter — a quote, an equals sign,
+	 * whitespace, a bracket, an opening parenthesis in CSS url(). An absolute
+	 * URL has the host there instead. Matching that delimiter and putting it
+	 * back is precise enough to be safe both ways.
+	 *
+	 * @param string $from Path prefix as it appears now, e.g. 'subdir' or ''.
+	 * @param string $to   Path prefix it should become.
+	 *
+	 * @return void
+	 */
+	public function add_root_relative_pair( $from, $to ) {
+		$from = trim( (string) $from, '/' );
+		$to   = trim( (string) $to, '/' );
+
+		if ( $from === $to ) {
+			return;
+		}
+
+		$from = '' === $from ? '' : '/' . $from;
+		$to   = '' === $to ? '' : '/' . $to;
+
+		// Anchored on WordPress's own directories rather than on the path
+		// alone: '/blog' => '' would rewrite any text starting with /blog,
+		// while '/blog/wp-content' is unambiguously this site's.
+		$dirs = [ 'wp-content', 'wp-includes', 'wp-admin', 'wp-json' ];
+
+		// A JSON-encoded column writes its slashes escaped, so both forms are
+		// registered for the same reason add_pair() registers both.
+		$escaped_slash = chr( 92 ) . '/';
+
+		foreach ( $dirs as $dir ) {
+			$plain  = $from . '/' . $dir;
+			$become = $to . '/' . $dir;
+
+			$forms = [
+				[ $plain, $become ],
+				[
+					str_replace( '/', $escaped_slash, $plain ),
+					str_replace( '/', $escaped_slash, $become ),
+				],
+			];
+
+			foreach ( $forms as $form ) {
+				$this->pairs[] = [
+					'regex'   => true,
+					'search'  => '/(^|' . self::DELIMITERS . ')' . preg_quote( $form[0], '/' ) . '/',
+					// $1 puts the delimiter back. Any dollar sign in the
+					// replacement itself has to be escaped or preg_replace
+					// would read it as another backreference.
+					'replace' => '$1' . str_replace( '$', chr( 92 ) . '$', $form[1] ),
+					'ci'      => false,
+				];
+			}
 		}
 	}
 
@@ -138,6 +221,15 @@ class FW_SM_Replacer {
 
 		$from_path = '' !== $from_path ? untrailingslashit( wp_normalize_path( $from_path ) ) : '';
 		$to_path   = '' !== $to_path ? untrailingslashit( wp_normalize_path( $to_path ) ) : '';
+
+		// Root-relative URLs carry no host, so the pair above never sees them.
+		// A site moving between a subdirectory and a document root has to have
+		// its /subdir prefix added or removed on those separately, or every
+		// src="/subdir/wp-content/..." in the content points at nothing.
+		$replacer->add_root_relative_pair(
+			(string) wp_parse_url( $from_url, PHP_URL_PATH ),
+			(string) wp_parse_url( $to_url, PHP_URL_PATH )
+		);
 
 		if ( '' !== $from_path && $from_path !== $to_path ) {
 			// Paths ARE case sensitive on the filesystems that matter here.
@@ -290,9 +382,18 @@ class FW_SM_Replacer {
 		foreach ( $this->pairs as $pair ) {
 			$before = $value;
 
-			$value = $pair['ci']
-				? str_ireplace( $pair['search'], $pair['replace'], $value )
-				: str_replace( $pair['search'], $pair['replace'], $value );
+			if ( ! empty( $pair['regex'] ) ) {
+				$replaced = preg_replace( $pair['search'], $pair['replace'], $value );
+
+				// preg_replace returns null on backtrack limits and the like.
+				// Keeping the original is the only safe answer: a half-replaced
+				// value is worse than an unreplaced one.
+				$value = null === $replaced ? $value : $replaced;
+			} else {
+				$value = $pair['ci']
+					? str_ireplace( $pair['search'], $pair['replace'], $value )
+					: str_replace( $pair['search'], $pair['replace'], $value );
+			}
 
 			if ( $before !== $value ) {
 				$this->count++;

@@ -7,11 +7,11 @@ $manifest = [];
 $manifest['name']        = __( 'Site Migration', 'fw' );
 $manifest['slug']        = 'unysonplus-site-migration';
 $manifest['description'] = __(
-	'Packages a WordPress site — database and files — into a single portable archive, and restores one onto another install. The whole job runs in the background in resumable slices, so it survives PHP timeouts and a closed browser, and URLs are rewritten with a serialization-aware replacer that leaves serialized and JSON data intact.',
+	'Moves a whole WordPress site to another install. The destination shows a connection key, you paste it into the source, and the source pushes everything — database, uploads, themes and plugins — in resumable background slices that survive PHP timeouts and a closed browser. URLs are rewritten with a serialization-aware replacer, and the destination only swaps the new data in once the migration finishes.',
 	'fw'
 );
 
-$manifest['version']    = '1.0.0';
+$manifest['version']    = '1.0.13';
 $manifest['display']    = true;
 $manifest['standalone'] = true;
 $manifest['thumbnail']  = 'thumbnail.svg';
@@ -34,58 +34,89 @@ $manifest['requires_wp']  = '5.8';
 /**
  * Changelog
  * -----------------------------------------------------------------------------
- * 1.0.0 - Initial release. Exports a site to a portable .zip archive and imports
- *         one back, with the whole job expressed as an ordered list of stages
- *         (database, uploads, themes, plugins, mu-plugins, other files) that are
- *         enqueued as individual jobs and processed a slice at a time by a
- *         self-respawning background runner, so neither a PHP timeout nor a
- *         closed browser ends a migration. Progress is denominated in bytes
- *         across every stage, so one honest progress bar covers a 400 MB uploads
- *         folder and a 12 MB table alike.
+ * 1.0.13 - Quick migration, a connection test, and a side-by-side comparison
+ *          with the destination.
  *
- *         Database export walks tables by primary key rather than LIMIT/OFFSET so
- *         a multi-million-row table resumes exactly where it stopped without the
- *         deep-offset penalty, and the importer loads rows into temporary tables
- *         that are only renamed into place once the whole import has succeeded —
- *         an interrupted import therefore leaves the destination site intact and
- *         serving. Foreign-key constraints are stripped from CREATE statements
- *         and re-applied as deferred ALTERs at the end, so table order is
- *         irrelevant.
+ *          Quick migration sends only the files the destination does not
+ *          already hold, byte for byte, with the database as an optional
+ *          whole. It exists for pushing a local site to a live one
+ *          repeatedly, where almost nothing has changed and re-sending a
+ *          themes folder is the entire cost.
  *
- *         Search and replace is recursive and serialization-aware: values are
- *         unserialized, walked, and re-serialized so length prefixes stay
- *         correct, with the same treatment for JSON payloads and a JSON-escaped
- *         variant of every pair so URLs embedded in escaped-slash JSON are caught
- *         too. This is the step a plain SQL REPLACE() gets wrong and is why
- *         hand-rolled migrations corrupt page-builder and widget data.
+ *          "Test connection speed" sends payloads of increasing size and
+ *          times each round trip against the destination's own reported
+ *          processing time, so a slow migration can be attributed to the
+ *          link, the far end, or this code rather than guessed at. It also
+ *          measures whether several connections move more than one, and
+ *          the file stage opens exactly as many as that measurement
+ *          justified — a long round trip leaves a single connection idle
+ *          waiting for acknowledgements, and no increase in request size
+ *          gets past it.
  *
- *         Destination options that must survive an import are carved out and
- *         restored afterwards — this extension's own settings, the active plugin
- *         list, and the prefix-dependent user capability keys that would
- *         otherwise lock every user out when source and destination table
- *         prefixes differ.
+ *          "Compare with destination" runs the same snapshot on both sites
+ *          and shows them side by side: theme, theme id, which Theme
+ *          Settings keys exist and whether they are readable, options that
+ *          no longer unserialize, and any table whose row count differs.
+ *          A migration can succeed by every measure it already takes and
+ *          still leave a site showing defaults, and the difference between
+ *          the two sides is the only thing that says so.
+
+ * 1.0.0 - Initial release. Migrates a whole site to another WordPress install
+ *         over HTTP. The destination displays a connection key; the user pastes
+ *         it into the source; the source pushes everything. There is no stage
+ *         selection and no archive file — a migration moves the site, and
+ *         choosing pieces is what the Backups extension is for.
  *
- *         Ships an optional compatibility mu-plugin that trims the active plugin
- *         list to a whitelist and swaps in a stub theme for the duration of a
- *         migration request, so a page builder, security plugin or caching layer
- *         cannot interfere with, or blow the memory budget of, a long-running
- *         slice.
+ *         The job is expressed as an ordered list of stages that enqueue jobs
+ *         into a custom table, processed a slice at a time by a background
+ *         runner that respawns itself over a loopback request and is watched by
+ *         a cron healthcheck. A PHP timeout costs one slice rather than the
+ *         migration, and closing the browser costs nothing. Progress is
+ *         denominated in bytes across every stage, so one progress bar honestly
+ *         covers a 400 MB uploads folder and a 12 MB table alike.
  *
- *         Import unpacks an archive in resumable slices before touching
- *         anything, validating every entry path as it goes: absolute paths and
- *         any name that escapes the working directory once normalized are
- *         refused rather than sanitized, because a name that needed sanitizing
- *         was never a name to trust. Entries are streamed to disk rather than
- *         read whole, so an archive containing a file larger than the memory
- *         limit does not end the import.
+ *         Requests between sites are signed with HMAC-SHA256 over every field,
+ *         sorted so both sides build the same input, and verified with
+ *         hash_equals() so the key cannot be recovered by timing the comparison.
+ *         A timestamp inside the signed payload bounds replay to a fifteen
+ *         minute window. Receiving endpoints are registered nopriv because the
+ *         source has no session on the destination; the signature is the only
+ *         thing that authorises them, so every handler verifies before acting.
  *
- *         Multisite is refused outright for now, and deliberately. Table
- *         discovery matches on the site prefix, and because esc_like() renders
- *         the underscore literal rather than as a wildcard, that pattern also
- *         matches every subsite's tables — so on a network the database stage
- *         would collect the whole network while the uploads stage collected a
- *         single subsite, and the archive would describe no site that exists.
- *         The required capability is raised to manage_network_options on
- *         multisite regardless, so the gate cannot be walked around by a site
- *         administrator who holds export.
+ *         Nothing is written over live data. SQL loads into _fwsm_-prefixed
+ *         staging tables and is renamed into place only by the finalize call, so
+ *         an interrupted or abandoned migration leaves the destination exactly
+ *         as it was. Incoming file paths are resolved against their stage root
+ *         and refused — not sanitized — if they escape it.
+ *
+ *         Search and replace is serialization-aware: values are unserialized,
+ *         walked and re-serialized so length prefixes stay correct, with the
+ *         same treatment for JSON and a JSON-escaped variant of every pair. A
+ *         plain SQL REPLACE() silently destroys page-builder and widget data.
+ *         Serialized objects are refused, and refusing to parse means returning
+ *         the value untouched rather than falling through to a string replace.
+ *
+ *         Destination values that must survive are carved out and restored: the
+ *         active plugin list, the site address, and the prefix-dependent user
+ *         capability keys that would otherwise lock every user out when source
+ *         and destination table prefixes differ.
+ *
+ *         Networks are supported in three shapes, and the difference between
+ *         them is almost entirely about which tables travel and what they are
+ *         called on arrival. A whole network replaces a whole network, carrying
+ *         the blog register and network options and repairing every site's
+ *         recorded domain and path afterwards. One site can be promoted out of
+ *         a network onto a single install, which renames its wp_<id>_ tables
+ *         down to the bare prefix and moves its uploads out of sites/<id>/. And
+ *         a single site can be folded into an existing network, which creates
+ *         the receiving site, renames tables up into its blog prefix, moves
+ *         uploads the other way and grants the network administrators a role on
+ *         it. Users travel when promoting a site out (a site nobody can log into
+ *         is not a migration) and stay behind when folding one in (merging user
+ *         rows into a network's shared table would collide on IDs).
+ *
+ *         Turning a single site into a network, or a network into a single site,
+ *         is refused. Both would require rewriting wp-config.php on the
+ *         destination, and a migration tool that edits the destination's
+ *         wp-config is one that can leave it unbootable.
  */

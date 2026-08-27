@@ -73,42 +73,80 @@ class FW_SM_File_Scanner {
 			'*/.vscode/*',
 		];
 
-		$per_stage = [
-			FW_SM_Stage::UPLOADS => [
-				// Regenerable image sizes are not excluded — regenerating them on
-				// the destination is slow and needs a plugin, so they travel.
-				'*/backup*/*',
-				'*/cache/*',
-			],
-			FW_SM_Stage::PLUGINS => [
-				// Caching plugins whose configuration is bound to the source host.
-				'*/w3-total-cache/*',
-				'*/wp-super-cache/*',
-				'*/wp-file-cache/*',
-				'*/hyper-cache/*',
-				// This extension's own archives, which must never nest inside one.
-				'*/unysonplus/migration/*',
-			],
-			FW_SM_Stage::MUPLUGINS => [
-				// Host-injected drop-ins that the destination provides itself.
-				'*/object-cache.php',
-				'*/advanced-cache.php',
-				'*/db.php',
-			],
-			FW_SM_Stage::OTHER => [
-				'*/cache/*',
-				'*/upgrade/*',
-				'*/uploads/*',
-				'*/w3tc-config/*',
-				'*/advanced-cache.php',
-				'*/object-cache.php',
-				'*/db.php',
-				'*/db-error.php',
-				'*/wp-cache-config.php',
-			],
-		];
+		// Built per stage rather than as one map, so resolving the OTHER stage's
+		// owned directories — which reads WP_CONTENT_DIR and the uploads path —
+		// does not happen every time some other stage asks for its excludes.
+		switch ( $stage ) {
+			case FW_SM_Stage::UPLOADS:
+				$specific = [
+					// On a network, blog 1's uploads root physically CONTAINS
+					// every other site's media under sites/<id>/. Scanning it
+					// without this silently drags the whole network into a
+					// single-site migration. Harmless on a single site: the
+					// directory simply does not exist.
+					'*/sites/*',
+					// Regenerable image sizes are NOT excluded — regenerating
+					// them on the destination is slow and needs a plugin, so
+					// they travel.
+					'*/backup*/*',
+					'*/cache/*',
+				];
+				break;
 
-		$excludes = array_merge( $common, $per_stage[ $stage ] ?? [] );
+			case FW_SM_Stage::PLUGINS:
+				$specific = [
+					// Caching plugins whose configuration is bound to the source host.
+					'*/w3-total-cache/*',
+					'*/wp-super-cache/*',
+					'*/wp-file-cache/*',
+					'*/hyper-cache/*',
+					'*/unysonplus/migration/*',
+				];
+				break;
+
+			case FW_SM_Stage::MUPLUGINS:
+				$specific = [
+					// Host-injected drop-ins the destination provides itself.
+					'*/object-cache.php',
+					'*/advanced-cache.php',
+					'*/db.php',
+				];
+				break;
+
+			case FW_SM_Stage::OTHER:
+				// Directories another stage already owns.
+				//
+				// Without these the OTHER stage walks straight back into themes
+				// and plugins and sends every one of their files a SECOND time.
+				// It is invisible in the result — the destination receives the
+				// same bytes twice — but it doubles the work, and on a real site
+				// that was 111 MB of pure duplication.
+				//
+				// Anchored at the stage root rather than '*/themes/*', so a
+				// plugin containing a 'themes' folder of its own is not dropped.
+				$specific = array_merge(
+					array_map(
+						static function ( $dir ) {
+							return '/' . $dir . '/*';
+						},
+						FW_SM_Stage::other_stage_owned_dirs()
+					),
+					[
+						'*/w3tc-config/*',
+						'*/advanced-cache.php',
+						'*/object-cache.php',
+						'*/db.php',
+						'*/db-error.php',
+						'*/wp-cache-config.php',
+					]
+				);
+				break;
+
+			default:
+				$specific = [];
+		}
+
+		$excludes = array_merge( $common, $specific );
 
 		/**
 		 * Filters the glob patterns excluded from a migration file stage.

@@ -16,15 +16,6 @@
  */
 class FW_SM_Stage {
 
-	/**
-	 * Import only: unpack the archive into a working directory before anything
-	 * is read from it. Extraction is its own stage because a large archive
-	 * cannot be unzipped inside one request any more than it could be built in
-	 * one, and because nothing should touch the destination until the archive
-	 * has proved itself readable.
-	 */
-	const EXTRACT = 'extract';
-
 	const DATABASE   = 'database';
 	const UPLOADS    = 'uploads';
 	const THEMES     = 'themes';
@@ -34,14 +25,18 @@ class FW_SM_Stage {
 	const FINALIZE   = 'finalize';
 
 	/**
-	 * Every stage a user may select, in the order they must run.
+	 * The stages a migration runs, in order.
 	 *
-	 * FINALIZE is deliberately absent — it is appended by the runner and is not
-	 * something a user opts out of.
+	 * There is no selection here, and that is the product decision rather than
+	 * an omission: a migration moves the whole site. Choosing pieces is what the
+	 * Backups extension is for, and offering it in both places would leave a
+	 * user with two half-answers instead of one whole one.
+	 *
+	 * FINALIZE is appended by the runner.
 	 *
 	 * @return string[]
 	 */
-	public static function selectable() {
+	public static function all() {
 		return [
 			self::DATABASE,
 			self::UPLOADS,
@@ -53,34 +48,6 @@ class FW_SM_Stage {
 	}
 
 	/**
-	 * The stages an import runs, in order.
-	 *
-	 * Extraction first, then the database into staging tables, then the files,
-	 * then the swap in finalize. The database goes before the files so that a
-	 * dump which fails to load costs nothing but time — no file on the
-	 * destination has been overwritten at that point.
-	 *
-	 * @param string[] $archive_stages Stages the archive actually contains.
-	 *
-	 * @return string[]
-	 */
-	public static function import_order( array $archive_stages ) {
-		$order = [ self::EXTRACT ];
-
-		if ( in_array( self::DATABASE, $archive_stages, true ) ) {
-			$order[] = self::DATABASE;
-		}
-
-		foreach ( [ self::UPLOADS, self::THEMES, self::PLUGINS, self::MUPLUGINS, self::OTHER ] as $stage ) {
-			if ( in_array( $stage, $archive_stages, true ) ) {
-				$order[] = $stage;
-			}
-		}
-
-		return $order;
-	}
-
-	/**
 	 * Human label for a stage, for the admin page and log lines.
 	 *
 	 * @param string $stage
@@ -89,7 +56,6 @@ class FW_SM_Stage {
 	 */
 	public static function label( $stage ) {
 		$labels = [
-			self::EXTRACT   => __( 'Unpacking the archive', 'fw' ),
 			self::DATABASE  => __( 'Database', 'fw' ),
 			self::UPLOADS   => __( 'Media uploads', 'fw' ),
 			self::THEMES    => __( 'Themes', 'fw' ),
@@ -127,12 +93,21 @@ class FW_SM_Stage {
 	 * the directory does not exist (a perfectly normal install may have none).
 	 *
 	 * @param string $stage
+	 * @param int    $blog_id Which site's uploads, on a network. 0/1 = the
+	 *                        current site.
 	 *
 	 * @return string|null Normalized, no trailing slash.
 	 */
-	public static function source_dir( $stage ) {
+	public static function source_dir( $stage, $blog_id = 0 ) {
 		switch ( $stage ) {
 			case self::UPLOADS:
+				// On a network each site has its own uploads root, so the blog
+				// being migrated decides which one this is.
+				if ( $blog_id > 1 && is_multisite() ) {
+					$path = FW_SM_Multisite::subsite_uploads_dir( $blog_id );
+					break;
+				}
+
 				$up = wp_upload_dir();
 				$path = $up['basedir'] ?? '';
 				break;
@@ -160,25 +135,59 @@ class FW_SM_Stage {
 	}
 
 	/**
-	 * Path prefix a stage's files occupy inside the archive.
+	 * Where a stage's files are written on the DESTINATION.
 	 *
-	 * Keeping this separate from the source directory is what lets an archive be
-	 * restored onto an install whose wp-content lives somewhere else entirely.
+	 * Separate from source_dir() on purpose. The source resolves its own paths;
+	 * the destination resolves its own, which is what lets a site move between
+	 * installs whose wp-content sits in different places. It also creates the
+	 * directory when it is legitimately missing (a destination may have no
+	 * mu-plugins folder yet), which source_dir() must never do.
+	 *
+	 * Returns null for anything that is not a file stage — the receiver treats
+	 * that as a refusal, so an unknown stage name cannot be used to steer a
+	 * write somewhere unintended.
 	 *
 	 * @param string $stage
 	 *
-	 * @return string
+	 * @return string|null Normalized, no trailing slash.
 	 */
-	public static function archive_dir( $stage ) {
-		$dirs = [
-			self::UPLOADS   => 'files/uploads',
-			self::THEMES    => 'files/themes',
-			self::PLUGINS   => 'files/plugins',
-			self::MUPLUGINS => 'files/mu-plugins',
-			self::OTHER     => 'files/other',
-		];
+	public static function destination_dir( $stage, $blog_id = 0 ) {
+		if ( ! self::is_file_stage( $stage ) ) {
+			return null;
+		}
 
-		return $dirs[ $stage ] ?? 'files/' . $stage;
+		// Files arriving for a specific site on this network land in that
+		// site's own uploads directory, which may not exist yet.
+		if ( self::UPLOADS === $stage && $blog_id > 1 && is_multisite() ) {
+			$dir = FW_SM_Multisite::subsite_uploads_dir( $blog_id );
+
+			if ( null !== $dir ) {
+				return $dir;
+			}
+
+			$path = wp_normalize_path( WP_CONTENT_DIR . '/uploads/sites/' . (int) $blog_id );
+
+			return wp_mkdir_p( $path ) ? untrailingslashit( $path ) : null;
+		}
+
+		$existing = self::source_dir( $stage );
+
+		if ( null !== $existing ) {
+			return $existing;
+		}
+
+		// Only mu-plugins is legitimately absent on a fresh install.
+		if ( self::MUPLUGINS === $stage ) {
+			$path = defined( 'WPMU_PLUGIN_DIR' )
+				? WPMU_PLUGIN_DIR
+				: WP_CONTENT_DIR . '/mu-plugins';
+
+			return wp_mkdir_p( $path )
+				? untrailingslashit( wp_normalize_path( $path ) )
+				: null;
+		}
+
+		return null;
 	}
 
 	/**

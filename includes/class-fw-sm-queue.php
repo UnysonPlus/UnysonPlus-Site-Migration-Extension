@@ -89,35 +89,6 @@ class FW_SM_Queue {
 		return true;
 	}
 
-	/**
-	 * Push one job.
-	 *
-	 * @param string $stage   Stage the job belongs to.
-	 * @param array  $payload Job data — a table name, or a file descriptor.
-	 * @param int    $bytes   The job's cost, used for progress totals.
-	 *
-	 * @return bool
-	 */
-	public static function push( $stage, array $payload, $bytes = 0 ) {
-		global $wpdb;
-
-		$encoded = wp_json_encode( $payload );
-
-		if ( false === $encoded ) {
-			return false;
-		}
-
-		return (bool) $wpdb->insert(
-			self::table(),
-			[
-				'stage'      => $stage,
-				'payload'    => $encoded,
-				'bytes'      => max( 0, (int) $bytes ),
-				'created_at' => current_time( 'mysql', true ),
-			],
-			[ '%s', '%s', '%d', '%s' ]
-		);
-	}
 
 	/**
 	 * Push many jobs in one statement.
@@ -237,6 +208,31 @@ class FW_SM_Queue {
 	 *
 	 * @return int The new attempt count.
 	 */
+	/**
+	 * Put a job's attempt counter back to zero.
+	 *
+	 * For when the conditions genuinely changed rather than the same thing
+	 * being tried again — a smaller batch after the destination ran out of
+	 * memory is a different request, and it should not inherit the failures of
+	 * the larger one.
+	 *
+	 * @param int $id
+	 *
+	 * @return void
+	 */
+	public static function reset_attempts( $id ) {
+		global $wpdb;
+
+		$table = self::table();
+
+		$wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$table} SET attempts = 0 WHERE id = %d", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				(int) $id
+			)
+		);
+	}
+
 	public static function bump_attempts( $id ) {
 		global $wpdb;
 
@@ -282,29 +278,6 @@ class FW_SM_Queue {
 		);
 	}
 
-	/**
-	 * Total remaining bytes, optionally for one stage.
-	 *
-	 * @param string $stage
-	 *
-	 * @return int
-	 */
-	public static function bytes( $stage = '' ) {
-		global $wpdb;
-
-		$table = self::table();
-
-		if ( '' === $stage ) {
-			return (int) $wpdb->get_var( "SELECT COALESCE(SUM(bytes), 0) FROM {$table}" ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-		}
-
-		return (int) $wpdb->get_var(
-			$wpdb->prepare(
-				"SELECT COALESCE(SUM(bytes), 0) FROM {$table} WHERE stage = %s", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-				$stage
-			)
-		);
-	}
 
 	/**
 	 * Empty the queue — on cancel, and at the end of a successful migration.
