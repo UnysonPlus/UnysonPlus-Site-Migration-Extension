@@ -58,6 +58,16 @@ class FW_SM_Runner {
 	const MIN_BATCH_BYTES = 262144; // 256 KB
 
 	/**
+	 * How many queued tables a single database batch may look at.
+	 *
+	 * A bound on the work one pass does, not on the batch size — the byte
+	 * cap already governs that. It exists so a network with thousands of
+	 * empty tables cannot spend an entire slice building SQL instead of
+	 * sending it.
+	 */
+	const PACK_MAX_TABLES = 60;
+
+	/**
 	 * Give up on a job after this many failed attempts.
 	 */
 	const MAX_ATTEMPTS = 3;
@@ -843,6 +853,57 @@ class FW_SM_Runner {
 		$build_ms = (int) round( ( microtime( true ) - $t_build ) * 1000 );
 		$sql_kb   = (int) round( strlen( $sql ) / 1024 );
 
+		// A batch stops at the end of a table, and on a single site that costs
+		// nothing: its tables are big enough to fill the byte cap on their own,
+		// so the loop below never runs.
+		//
+		// A network is the opposite. Six hundred tables, most of them a few
+		// kilobytes of WooCommerce bookkeeping, means six hundred round trips
+		// to move almost nothing — measured at 58 KB per request against an
+		// 8 MB cap, with the destination working for 10 seconds out of five
+		// minutes. The rest was latency.
+		//
+		// So once this table is finished, whole further tables are appended
+		// until the cap is reached. WHOLE ones only: a table is packed only if
+		// its recorded size fits in what is left, which keeps every cursor in
+		// this method about a single table and leaves the retry path unchanged.
+		$packed = [];
+
+		if ( ! empty( $rows['done'] ) ) {
+			$budget = self::batch_ceiling() - strlen( $sql );
+
+			foreach ( FW_SM_Queue::peek( self::PACK_MAX_TABLES ) as $next ) {
+				$name = self::packable_table( $next, $budget, (int) $job['id'] );
+
+				if ( '' === $name ) {
+					continue;
+				}
+
+				$schema = $export->build_schema( $name );
+
+				if ( is_wp_error( $schema ) ) {
+					break;
+				}
+
+				$more = $export->build_rows( $name, FW_SM_DB_Export::primary_key( $name ), '', 0 );
+
+				if ( is_wp_error( $more ) || empty( $more['done'] ) ) {
+					// Bigger than its estimate suggested. Leave it to a pass of its
+					// own rather than carrying half of it here.
+					break;
+				}
+
+				$sql    .= $schema . $more['sql'];
+				$budget -= strlen( $schema ) + strlen( $more['sql'] );
+
+				$packed[] = [ 'id' => (int) $next['id'], 'bytes' => (int) $next['bytes'] ];
+
+				if ( $budget <= 0 ) {
+					break;
+				}
+			}
+		}
+
 		if ( '' !== trim( $sql ) ) {
 			$t_send = microtime( true );
 
@@ -924,6 +985,13 @@ class FW_SM_Runner {
 		if ( $rows['done'] ) {
 			FW_SM_Queue::delete( $job['id'] );
 			FW_SM_State::set_cursor( [ 'db_table' => '' ] );
+		}
+
+		// The tables that rode along. Cleared here for the same reason as the
+		// cursor above — a failed send must leave every one of them queued.
+		foreach ( $packed as $done ) {
+			FW_SM_Queue::delete( $done['id'] );
+			$processed += $done['bytes'];
 		}
 
 		return [ 'processed_bytes' => $processed, 'complete' => false ];
@@ -1425,6 +1493,43 @@ class FW_SM_Runner {
 		$learned = (int) FW_SM_State::cursor( 'batch_ceiling', 0 );
 
 		return $learned > 0 ? $learned : self::safe_payload_size();
+	}
+
+	/**
+	 * May this queued job ride along in a database batch already being built?
+	 *
+	 * Separated from the loop that uses it because it is the whole safety
+	 * argument for packing: a table is only ever added WHOLE, and only when
+	 * it comfortably fits what is left of the byte cap. Everything that keeps
+	 * the retry path unchanged follows from that.
+	 *
+	 * @param array $job     A queued job, as peek() returns it.
+	 * @param int   $budget  Bytes left in the current batch.
+	 * @param int   $current The job already being sent, which must not repeat.
+	 *
+	 * @return string The table name, or '' if it may not be packed.
+	 */
+	public static function packable_table( $job, $budget, $current ) {
+		if ( FW_SM_Stage::DATABASE !== ( $job['stage'] ?? '' ) ) {
+			return '';
+		}
+
+		if ( (int) ( $job['id'] ?? 0 ) === (int) $current ) {
+			return '';
+		}
+
+		// Sizes come from information_schema and are estimates — for InnoDB
+		// they can be well off. Requiring twice the estimate to fit means an
+		// optimistic one cannot push the batch past the size the destination
+		// has actually proved it survives.
+		if ( 2 * (int) ( $job['bytes'] ?? 0 ) > (int) $budget ) {
+			return '';
+		}
+
+		$payload = $job['payload'] ?? [];
+		$payload = is_array( $payload ) ? $payload : (array) json_decode( (string) $payload, true );
+
+		return (string) ( $payload['table'] ?? '' );
 	}
 
 	/**
