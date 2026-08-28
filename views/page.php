@@ -118,7 +118,7 @@ $tab_url = static function ( $which ) {
 						</p>
 
 						<div style="background:#f0f0f1;border-radius:3px;height:24px;overflow:hidden">
-							<div id="fw-sm-bar" style="background:#2271b1;height:100%;width:0;transition:width .4s ease"></div>
+							<div id="fw-sm-bar" style="background:var(--fw-accent, #3858e9);height:100%;width:0;transition:width .4s ease"></div>
 						</div>
 						<p style="margin:.6em 0 1.2em">
 							<strong id="fw-sm-percent">0%</strong>
@@ -236,7 +236,7 @@ $tab_url = static function ( $which ) {
 							( d.stages || [] ).forEach( function ( s ) {
 								var li = document.createElement( 'li' );
 								li.style.padding = '.25em 0';
-								li.style.color = s.processed ? '#1a7f37' : ( s.active ? '#2271b1' : '#787c82' );
+								li.style.color = s.processed ? '#1a7f37' : ( s.active ? 'var(--fw-accent, #3858e9)' : '#787c82' );
 								li.textContent = ( s.processed ? '✓' : ( s.active ? '•' : '·' ) ) + '  ' + s.label;
 								stages.appendChild( li );
 							} );
@@ -764,199 +764,392 @@ $tab_url = static function ( $which ) {
 							?>
 						</p>
 
-						<?php $cmp = get_option( FW_Extension_Site_Migration::INSPECT_OPTION, null ); ?>
-						<?php if ( is_array( $cmp ) && ! empty( $cmp['source'] ) && ! empty( $cmp['dest'] ) ) : ?>
-							<?php
-							$src = (array) $cmp['source'];
-							$dst = (array) $cmp['dest'];
-
-							$ts_src = (array) ( $src['theme_settings'] ?? [] );
-							$ts_dst = (array) ( $dst['theme_settings'] ?? [] );
-
-							// Rows are [ label, source, destination, difference
-							// expected ]. Marking the expected ones matters: the
-							// address and the install path are SUPPOSED to
-							// differ, and flagging them would bury the
-							// differences that are actual problems.
-							$rows = [
-								[ __( 'Address', 'fw' ), $src['site_url'] ?? '', $dst['site_url'] ?? '', true ],
-								[ __( 'Install path', 'fw' ), $src['abspath'] ?? '', $dst['abspath'] ?? '', true ],
-								[ __( 'WordPress', 'fw' ), $src['wp'] ?? '', $dst['wp'] ?? '', false ],
-								[ __( 'Site Migration version', 'fw' ), $src['extension'] ?? '', $dst['extension'] ?? '', false ],
-								[ __( 'Active theme', 'fw' ), $src['stylesheet'] ?? '', $dst['stylesheet'] ?? '', false ],
-								[ __( 'Parent theme', 'fw' ), $src['template'] ?? '', $dst['template'] ?? '', false ],
-								[
-									__( 'Parent theme files', 'fw' ),
-									empty( $src['template_dir_exists'] ) ? __( 'MISSING', 'fw' ) : (string) (int) ( $src['template_files'] ?? 0 ),
-									empty( $dst['template_dir_exists'] ) ? __( 'MISSING', 'fw' ) : (string) (int) ( $dst['template_files'] ?? 0 ),
-									false,
-								],
-								[
-									__( 'Parent theme manifest', 'fw' ),
-									empty( $src['template_manifest'] ) ? __( 'missing', 'fw' ) : __( 'present', 'fw' ),
-									empty( $dst['template_manifest'] ) ? __( 'missing', 'fw' ) : __( 'present', 'fw' ),
-									false,
-								],
-								[ __( 'Theme id used for settings', 'fw' ), $ts_src['theme_id'] ?? '', $ts_dst['theme_id'] ?? '', false ],
-								[
-									__( 'Theme Settings readable', 'fw' ),
-									empty( $ts_src['readable'] ) ? __( 'NO', 'fw' ) : size_format( (int) ( $ts_src['bytes'] ?? 0 ) ),
-									empty( $ts_dst['readable'] ) ? __( 'NO', 'fw' ) : size_format( (int) ( $ts_dst['bytes'] ?? 0 ) ),
-									false,
-								],
-								[ __( 'Options', 'fw' ), (string) ( $src['options_total'] ?? 0 ), (string) ( $dst['options_total'] ?? 0 ), true ],
-								[ __( 'Unreadable options', 'fw' ), (string) ( $src['options_unreadable'] ?? 0 ), (string) ( $dst['options_unreadable'] ?? 0 ), false ],
-								[ __( 'Active extensions', 'fw' ), (string) ( $src['active_extensions'] ?? 0 ), (string) ( $dst['active_extensions'] ?? 0 ), false ],
-							];
-							?>
-
-							<div style="margin-top:1.4em">
-								<h4 style="margin:0 0 .4em">
-									<?php esc_html_e( 'This site vs the destination', 'fw' ); ?>
-									<span class="description" style="font-weight:400">
-										&mdash;
-										<?php
-										printf(
-											/* translators: %s: human time diff. */
-											esc_html__( '%s ago', 'fw' ),
-											esc_html( human_time_diff( (int) ( $cmp['at'] ?? time() ) ) )
-										);
-										?>
-									</span>
-								</h4>
-
-								<table class="widefat striped" style="max-width:60em">
-									<thead>
-										<tr>
-											<th style="width:16em"><?php esc_html_e( 'What', 'fw' ); ?></th>
-											<th><?php esc_html_e( 'This site', 'fw' ); ?></th>
-											<th><?php esc_html_e( 'Destination', 'fw' ); ?></th>
-										</tr>
-									</thead>
-									<tbody>
-										<?php foreach ( $rows as $row ) : ?>
-											<?php $differs = ! $row[3] && (string) $row[1] !== (string) $row[2]; ?>
-											<tr<?php echo $differs ? ' style="background:#fcf0f1"' : ''; ?>>
-												<td>
-													<strong><?php echo esc_html( $row[0] ); ?></strong>
-													<?php if ( $differs ) : ?>
-														<span class="description" style="color:#b32d2e">&nbsp;&larr; <?php esc_html_e( 'differs', 'fw' ); ?></span>
-													<?php endif; ?>
-												</td>
-												<td><?php echo esc_html( $row[1] ); ?></td>
-												<td><?php echo esc_html( $row[2] ); ?></td>
-											</tr>
-										<?php endforeach; ?>
-									</tbody>
-								</table>
-
-								<?php if ( ! empty( $ts_src['keys'] ) || ! empty( $ts_dst['keys'] ) ) : ?>
-									<h4 style="margin:1.2em 0 .4em"><?php esc_html_e( 'Theme Settings keys present', 'fw' ); ?></h4>
-									<table class="widefat striped" style="max-width:60em">
-										<thead>
-											<tr>
-												<th style="width:26em"><?php esc_html_e( 'Option', 'fw' ); ?></th>
-												<th><?php esc_html_e( 'This site', 'fw' ); ?></th>
-												<th><?php esc_html_e( 'Destination', 'fw' ); ?></th>
-											</tr>
-										</thead>
-										<tbody>
-											<?php
-											$keys = array_unique(
-												array_merge(
-													array_keys( (array) ( $ts_src['keys'] ?? [] ) ),
-													array_keys( (array) ( $ts_dst['keys'] ?? [] ) )
-												)
-											);
-											sort( $keys );
-											?>
-											<?php foreach ( $keys as $key ) : ?>
-												<tr>
-													<td><code><?php echo esc_html( $key ); ?></code></td>
-													<td>
-														<?php
-														echo isset( $ts_src['keys'][ $key ] )
-															? esc_html( size_format( (int) $ts_src['keys'][ $key ] ) )
-															: '<em>' . esc_html__( 'absent', 'fw' ) . '</em>';
-														?>
-													</td>
-													<td>
-														<?php
-														echo isset( $ts_dst['keys'][ $key ] )
-															? esc_html( size_format( (int) $ts_dst['keys'][ $key ] ) )
-															: '<em>' . esc_html__( 'absent', 'fw' ) . '</em>';
-														?>
-													</td>
-												</tr>
-											<?php endforeach; ?>
-										</tbody>
-									</table>
-
-									<p class="description" style="max-width:56em;margin-top:.6em">
-										<?php
-										esc_html_e(
-											'Theme Settings are stored under the theme id taken from the theme manifest, falling back to "default". If the destination holds the settings under one id but resolves another, every setting reads as unset and the site shows defaults — which looks exactly like the settings never migrated.',
-											'fw'
-										);
-										?>
-									</p>
-								<?php endif; ?>
-
-								<?php
-								// Row counts, compared by the table name with each
-								// side's own prefix removed — the prefixes may
-								// legitimately differ.
-								$t_src = (array) ( $src['tables'] ?? [] );
-								$t_dst = (array) ( $dst['tables'] ?? [] );
-								$diff  = [];
-
-								foreach ( $t_src as $name => $count ) {
-									$bare  = substr( $name, strlen( (string) ( $src['prefix'] ?? '' ) ) );
-									$there = null;
-
-									foreach ( $t_dst as $dname => $dcount ) {
-										if ( substr( $dname, strlen( (string) ( $dst['prefix'] ?? '' ) ) ) === $bare ) {
-											$there = $dcount;
-											break;
-										}
-									}
-
-									if ( $there !== $count ) {
-										$diff[] = [ $bare, $count, null === $there ? __( 'absent', 'fw' ) : $there ];
-									}
-								}
-								?>
-
-								<?php if ( ! empty( $diff ) ) : ?>
-									<h4 style="margin:1.2em 0 .4em"><?php esc_html_e( 'Tables whose row counts differ', 'fw' ); ?></h4>
-									<table class="widefat striped" style="max-width:60em">
-										<thead>
-											<tr>
-												<th style="width:26em"><?php esc_html_e( 'Table', 'fw' ); ?></th>
-												<th><?php esc_html_e( 'This site', 'fw' ); ?></th>
-												<th><?php esc_html_e( 'Destination', 'fw' ); ?></th>
-											</tr>
-										</thead>
-										<tbody>
-											<?php foreach ( $diff as $d ) : ?>
-												<tr>
-													<td><code><?php echo esc_html( $d[0] ); ?></code></td>
-													<td><?php echo esc_html( number_format( (int) $d[1] ) ); ?></td>
-													<td><?php echo esc_html( is_numeric( $d[2] ) ? number_format( (int) $d[2] ) : $d[2] ); ?></td>
-												</tr>
-											<?php endforeach; ?>
-										</tbody>
-									</table>
-									<p class="description" style="max-width:56em;margin-top:.6em">
-										<?php
-										esc_html_e(
-											'Some difference is normal right after a migration — the destination keeps its own users and its own copy of this extension bookkeeping. A content table that differs is not normal.',
-											'fw'
-										);
-										?>
-									</p>
-								<?php endif; ?>
-
+						<?php $cmp = get_option( FW_Extension_Site_Migration::INSPECT_OPTION, null ); ?>
+
+						<?php if ( is_array( $cmp ) && ! empty( $cmp['source'] ) && ! empty( $cmp['dest'] ) ) : ?>
+
+							<?php
+
+							$src = (array) $cmp['source'];
+
+							$dst = (array) $cmp['dest'];
+
+
+
+							$ts_src = (array) ( $src['theme_settings'] ?? [] );
+
+							$ts_dst = (array) ( $dst['theme_settings'] ?? [] );
+
+
+
+							// Rows are [ label, source, destination, difference
+
+							// expected ]. Marking the expected ones matters: the
+
+							// address and the install path are SUPPOSED to
+
+							// differ, and flagging them would bury the
+
+							// differences that are actual problems.
+
+							$rows = [
+
+								[ __( 'Address', 'fw' ), $src['site_url'] ?? '', $dst['site_url'] ?? '', true ],
+
+								[ __( 'Install path', 'fw' ), $src['abspath'] ?? '', $dst['abspath'] ?? '', true ],
+
+								[ __( 'WordPress', 'fw' ), $src['wp'] ?? '', $dst['wp'] ?? '', false ],
+
+								[ __( 'Site Migration version', 'fw' ), $src['extension'] ?? '', $dst['extension'] ?? '', false ],
+
+								[ __( 'Active theme', 'fw' ), $src['stylesheet'] ?? '', $dst['stylesheet'] ?? '', false ],
+
+								[ __( 'Parent theme', 'fw' ), $src['template'] ?? '', $dst['template'] ?? '', false ],
+
+								[
+
+									__( 'Parent theme files', 'fw' ),
+
+									empty( $src['template_dir_exists'] ) ? __( 'MISSING', 'fw' ) : (string) (int) ( $src['template_files'] ?? 0 ),
+
+									empty( $dst['template_dir_exists'] ) ? __( 'MISSING', 'fw' ) : (string) (int) ( $dst['template_files'] ?? 0 ),
+
+									false,
+
+								],
+
+								[
+
+									__( 'Parent theme manifest', 'fw' ),
+
+									empty( $src['template_manifest'] ) ? __( 'missing', 'fw' ) : __( 'present', 'fw' ),
+
+									empty( $dst['template_manifest'] ) ? __( 'missing', 'fw' ) : __( 'present', 'fw' ),
+
+									false,
+
+								],
+
+								[ __( 'Theme id used for settings', 'fw' ), $ts_src['theme_id'] ?? '', $ts_dst['theme_id'] ?? '', false ],
+
+								[
+
+									__( 'Theme Settings readable', 'fw' ),
+
+									empty( $ts_src['readable'] ) ? __( 'NO', 'fw' ) : size_format( (int) ( $ts_src['bytes'] ?? 0 ) ),
+
+									empty( $ts_dst['readable'] ) ? __( 'NO', 'fw' ) : size_format( (int) ( $ts_dst['bytes'] ?? 0 ) ),
+
+									false,
+
+								],
+
+								[ __( 'Options', 'fw' ), (string) ( $src['options_total'] ?? 0 ), (string) ( $dst['options_total'] ?? 0 ), true ],
+
+								[ __( 'Unreadable options', 'fw' ), (string) ( $src['options_unreadable'] ?? 0 ), (string) ( $dst['options_unreadable'] ?? 0 ), false ],
+
+								[ __( 'Active extensions', 'fw' ), (string) ( $src['active_extensions'] ?? 0 ), (string) ( $dst['active_extensions'] ?? 0 ), false ],
+
+							];
+
+							?>
+
+
+
+							<div style="margin-top:1.4em">
+
+								<h4 style="margin:0 0 .4em">
+
+									<?php esc_html_e( 'This site vs the destination', 'fw' ); ?>
+
+									<span class="description" style="font-weight:400">
+
+										&mdash;
+
+										<?php
+
+										printf(
+
+											/* translators: %s: human time diff. */
+
+											esc_html__( '%s ago', 'fw' ),
+
+											esc_html( human_time_diff( (int) ( $cmp['at'] ?? time() ) ) )
+
+										);
+
+										?>
+
+									</span>
+
+								</h4>
+
+
+
+								<table class="widefat striped" style="max-width:60em">
+
+									<thead>
+
+										<tr>
+
+											<th style="width:16em"><?php esc_html_e( 'What', 'fw' ); ?></th>
+
+											<th><?php esc_html_e( 'This site', 'fw' ); ?></th>
+
+											<th><?php esc_html_e( 'Destination', 'fw' ); ?></th>
+
+										</tr>
+
+									</thead>
+
+									<tbody>
+
+										<?php foreach ( $rows as $row ) : ?>
+
+											<?php $differs = ! $row[3] && (string) $row[1] !== (string) $row[2]; ?>
+
+											<tr<?php echo $differs ? ' style="background:#fcf0f1"' : ''; ?>>
+
+												<td>
+
+													<strong><?php echo esc_html( $row[0] ); ?></strong>
+
+													<?php if ( $differs ) : ?>
+
+														<span class="description" style="color:#b32d2e">&nbsp;&larr; <?php esc_html_e( 'differs', 'fw' ); ?></span>
+
+													<?php endif; ?>
+
+												</td>
+
+												<td><?php echo esc_html( $row[1] ); ?></td>
+
+												<td><?php echo esc_html( $row[2] ); ?></td>
+
+											</tr>
+
+										<?php endforeach; ?>
+
+									</tbody>
+
+								</table>
+
+
+
+								<?php if ( ! empty( $ts_src['keys'] ) || ! empty( $ts_dst['keys'] ) ) : ?>
+
+									<h4 style="margin:1.2em 0 .4em"><?php esc_html_e( 'Theme Settings keys present', 'fw' ); ?></h4>
+
+									<table class="widefat striped" style="max-width:60em">
+
+										<thead>
+
+											<tr>
+
+												<th style="width:26em"><?php esc_html_e( 'Option', 'fw' ); ?></th>
+
+												<th><?php esc_html_e( 'This site', 'fw' ); ?></th>
+
+												<th><?php esc_html_e( 'Destination', 'fw' ); ?></th>
+
+											</tr>
+
+										</thead>
+
+										<tbody>
+
+											<?php
+
+											$keys = array_unique(
+
+												array_merge(
+
+													array_keys( (array) ( $ts_src['keys'] ?? [] ) ),
+
+													array_keys( (array) ( $ts_dst['keys'] ?? [] ) )
+
+												)
+
+											);
+
+											sort( $keys );
+
+											?>
+
+											<?php foreach ( $keys as $key ) : ?>
+
+												<tr>
+
+													<td><code><?php echo esc_html( $key ); ?></code></td>
+
+													<td>
+
+														<?php
+
+														echo isset( $ts_src['keys'][ $key ] )
+
+															? esc_html( size_format( (int) $ts_src['keys'][ $key ] ) )
+
+															: '<em>' . esc_html__( 'absent', 'fw' ) . '</em>';
+
+														?>
+
+													</td>
+
+													<td>
+
+														<?php
+
+														echo isset( $ts_dst['keys'][ $key ] )
+
+															? esc_html( size_format( (int) $ts_dst['keys'][ $key ] ) )
+
+															: '<em>' . esc_html__( 'absent', 'fw' ) . '</em>';
+
+														?>
+
+													</td>
+
+												</tr>
+
+											<?php endforeach; ?>
+
+										</tbody>
+
+									</table>
+
+
+
+									<p class="description" style="max-width:56em;margin-top:.6em">
+
+										<?php
+
+										esc_html_e(
+
+											'Theme Settings are stored under the theme id taken from the theme manifest, falling back to "default". If the destination holds the settings under one id but resolves another, every setting reads as unset and the site shows defaults — which looks exactly like the settings never migrated.',
+
+											'fw'
+
+										);
+
+										?>
+
+									</p>
+
+								<?php endif; ?>
+
+
+
+								<?php
+
+								// Row counts, compared by the table name with each
+
+								// side's own prefix removed — the prefixes may
+
+								// legitimately differ.
+
+								$t_src = (array) ( $src['tables'] ?? [] );
+
+								$t_dst = (array) ( $dst['tables'] ?? [] );
+
+								$diff  = [];
+
+
+
+								foreach ( $t_src as $name => $count ) {
+
+									$bare  = substr( $name, strlen( (string) ( $src['prefix'] ?? '' ) ) );
+
+									$there = null;
+
+
+
+									foreach ( $t_dst as $dname => $dcount ) {
+
+										if ( substr( $dname, strlen( (string) ( $dst['prefix'] ?? '' ) ) ) === $bare ) {
+
+											$there = $dcount;
+
+											break;
+
+										}
+
+									}
+
+
+
+									if ( $there !== $count ) {
+
+										$diff[] = [ $bare, $count, null === $there ? __( 'absent', 'fw' ) : $there ];
+
+									}
+
+								}
+
+								?>
+
+
+
+								<?php if ( ! empty( $diff ) ) : ?>
+
+									<h4 style="margin:1.2em 0 .4em"><?php esc_html_e( 'Tables whose row counts differ', 'fw' ); ?></h4>
+
+									<table class="widefat striped" style="max-width:60em">
+
+										<thead>
+
+											<tr>
+
+												<th style="width:26em"><?php esc_html_e( 'Table', 'fw' ); ?></th>
+
+												<th><?php esc_html_e( 'This site', 'fw' ); ?></th>
+
+												<th><?php esc_html_e( 'Destination', 'fw' ); ?></th>
+
+											</tr>
+
+										</thead>
+
+										<tbody>
+
+											<?php foreach ( $diff as $d ) : ?>
+
+												<tr>
+
+													<td><code><?php echo esc_html( $d[0] ); ?></code></td>
+
+													<td><?php echo esc_html( number_format( (int) $d[1] ) ); ?></td>
+
+													<td><?php echo esc_html( is_numeric( $d[2] ) ? number_format( (int) $d[2] ) : $d[2] ); ?></td>
+
+												</tr>
+
+											<?php endforeach; ?>
+
+										</tbody>
+
+									</table>
+
+									<p class="description" style="max-width:56em;margin-top:.6em">
+
+										<?php
+
+										esc_html_e(
+
+											'Some difference is normal right after a migration — the destination keeps its own users and its own copy of this extension bookkeeping. A content table that differs is not normal.',
+
+											'fw'
+
+										);
+
+										?>
+
+									</p>
+
+								<?php endif; ?>
+
+
+
 							<?php if ( ! empty( $cmp['forensic'] ) ) : ?>
 								<h4 style="margin:1.4em 0 .4em"><?php esc_html_e( 'Why those options cannot be read', 'fw' ); ?></h4>
 
@@ -1049,21 +1242,36 @@ $tab_url = static function ( $which ) {
 								</p>
 							<?php endif; ?>
 
-								<?php if ( ! empty( $dst['options_unreadable'] ) ) : ?>
-									<p class="description" style="max-width:56em;margin-top:.8em">
-										<strong style="color:#b32d2e">
-											<?php
-											printf(
-												/* translators: %d: number of options. */
-												esc_html__( '%d option(s) on the destination no longer unserialize.', 'fw' ),
-												(int) $dst['options_unreadable']
-											);
-											?>
-										</strong>
-										<?php echo esc_html( implode( ', ', (array) ( $dst['unreadable_eg'] ?? [] ) ) ); ?>
-									</p>
-								<?php endif; ?>
-							</div>
+								<?php if ( ! empty( $dst['options_unreadable'] ) ) : ?>
+
+									<p class="description" style="max-width:56em;margin-top:.8em">
+
+										<strong style="color:#b32d2e">
+
+											<?php
+
+											printf(
+
+												/* translators: %d: number of options. */
+
+												esc_html__( '%d option(s) on the destination no longer unserialize.', 'fw' ),
+
+												(int) $dst['options_unreadable']
+
+											);
+
+											?>
+
+										</strong>
+
+										<?php echo esc_html( implode( ', ', (array) ( $dst['unreadable_eg'] ?? [] ) ) ); ?>
+
+									</p>
+
+								<?php endif; ?>
+
+							</div>
+
 						<?php endif; ?>
 
 						<?php $diag = get_option( FW_Extension_Site_Migration::DIAGNOSTIC_OPTION, null ); ?>
