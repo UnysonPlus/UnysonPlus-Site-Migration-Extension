@@ -135,6 +135,125 @@ class FW_SM_Stage {
 	}
 
 	/**
+	 * The top-level entries of a stage's source directory.
+	 *
+	 * What a person actually thinks in when deciding what to push: plugin and
+	 * theme folders, upload years. Deliberately one level deep and unsorted by
+	 * size — walking twenty plugin folders to count their files would cost tens
+	 * of thousands of stat calls on every page load, to help with a decision
+	 * the names already answer.
+	 *
+	 * @param string $stage
+	 * @param int    $blog_id
+	 *
+	 * @return array[] Each: [ 'name' => string, 'dir' => bool ].
+	 */
+	public static function top_level( $stage, $blog_id = 0 ) {
+		if ( ! self::is_file_stage( $stage ) ) {
+			return [];
+		}
+
+		$root = self::source_dir( $stage, $blog_id );
+
+		if ( null === $root || ! is_dir( $root ) ) {
+			return [];
+		}
+
+		$entries = @scandir( $root ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+
+		if ( false === $entries ) {
+			return [];
+		}
+
+		$owned = self::OTHER === $stage ? self::other_stage_owned_dirs() : [];
+		$out   = [];
+
+		foreach ( $entries as $entry ) {
+			if ( '.' === $entry || '..' === $entry ) {
+				continue;
+			}
+
+			// Directories another stage already sends are not this stage's to
+			// offer — unchecking "themes" here would be a second, contradictory
+			// control over the same files.
+			if ( in_array( $entry, $owned, true ) ) {
+				continue;
+			}
+
+			// A subsite's uploads root is itself .../uploads/sites/<id>, so the
+			// sites/ directory only appears for the main site, where it holds
+			// every OTHER site's media and is excluded from the scan anyway.
+			if ( self::UPLOADS === $stage && 'sites' === $entry && (int) $blog_id <= 1 ) {
+				continue;
+			}
+
+			$out[] = [
+				'name' => $entry,
+				'dir'  => is_dir( $root . '/' . $entry ),
+			];
+		}
+
+		usort(
+			$out,
+			static function ( $a, $b ) {
+				// Directories first, then alphabetical — the folders are what
+				// anyone is looking for.
+				if ( $a['dir'] !== $b['dir'] ) {
+					return $a['dir'] ? -1 : 1;
+				}
+
+				return strcasecmp( $a['name'], $b['name'] );
+			}
+		);
+
+		return $out;
+	}
+
+	/**
+	 * Turn a chosen subset of top-level entries into scanner exclusions.
+	 *
+	 * Expressed as exclusions rather than as a new kind of filter so that
+	 * selection rides the mechanism the scanner already has, and cannot
+	 * disagree with it.
+	 *
+	 * An empty or absent selection means everything, which is what a migration
+	 * with no opinion should do.
+	 *
+	 * @param string   $stage
+	 * @param array    $chosen  Names the user kept.
+	 * @param int      $blog_id
+	 *
+	 * @return string[] Patterns for the entries NOT chosen.
+	 */
+	public static function excludes_for_selection( $stage, $chosen, $blog_id = 0 ) {
+		// Trimmed before the emptiness test: a whitespace-only name is blank,
+		// but strlen() would call it a selection and exclude everything else.
+		$chosen = array_filter( array_map( 'trim', array_map( 'strval', (array) $chosen ) ), 'strlen' );
+
+		if ( empty( $chosen ) ) {
+			return [];
+		}
+
+		$keep = array_flip( $chosen );
+		$out  = [];
+
+		foreach ( self::top_level( $stage, $blog_id ) as $entry ) {
+			if ( isset( $keep[ $entry['name'] ] ) ) {
+				continue;
+			}
+
+			// Anchored at the stage root, matching how the scanner tests a path
+			// ('/' . relative). A directory needs the trailing wildcard; a
+			// loose file at the top level does not.
+			$out[] = $entry['dir']
+				? '/' . $entry['name'] . '/*'
+				: '/' . $entry['name'];
+		}
+
+		return $out;
+	}
+
+	/**
 	 * Where a stage's files are written on the DESTINATION.
 	 *
 	 * Separate from source_dir() on purpose. The source resolves its own paths;

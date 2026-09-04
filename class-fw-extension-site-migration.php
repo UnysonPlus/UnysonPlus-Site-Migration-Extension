@@ -503,6 +503,42 @@ class FW_Extension_Site_Migration extends FW_Extension {
 		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- guard() ran check_admin_referer.
 		$quick = ! empty( $_POST['quick'] );
 
+		// Which top-level folders to send, per file stage.
+		//
+		// Only meaningful for a quick migration. A plain migration moves the
+		// whole site — that is what makes it a migration rather than a copy of
+		// some chosen parts — so the selection is read only when quick is on,
+		// and a stage with nothing selected means all of it.
+		$folders = [];
+
+		if ( $quick && isset( $_POST['folders'] ) && is_array( $_POST['folders'] ) ) {
+			// phpcs:ignore WordPress.Security.NonceVerification.Missing -- guard() ran check_admin_referer.
+			foreach ( wp_unslash( $_POST['folders'] ) as $stage => $names ) {
+				$stage = sanitize_key( $stage );
+
+				if ( ! FW_SM_Stage::is_file_stage( $stage ) || ! is_array( $names ) ) {
+					continue;
+				}
+
+				// Names are compared against what the filesystem actually holds
+				// before they become exclusions, so a value from the form can only
+				// ever narrow the set — never reach outside it.
+				$clean = [];
+
+				foreach ( $names as $name ) {
+					$name = trim( (string) $name );
+
+					if ( '' !== $name && false === strpos( $name, '/' ) && '..' !== $name ) {
+						$clean[] = $name;
+					}
+				}
+
+				if ( ! empty( $clean ) ) {
+					$folders[ $stage ] = array_values( array_unique( $clean ) );
+				}
+			}
+		}
+
 		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- guard() ran check_admin_referer.
 		$chosen = isset( $_POST['stages'] ) && is_array( $_POST['stages'] )
 			? array_map( 'sanitize_key', wp_unslash( $_POST['stages'] ) )
@@ -526,6 +562,7 @@ class FW_Extension_Site_Migration extends FW_Extension {
 			[
 				'mode'           => $mode,
 				'quick'          => $quick,
+				'folders'        => $folders,
 				'source_blog_id' => $blog_id,
 				'target_slug'    => '' !== $slug ? $slug : sanitize_title( get_bloginfo( 'name' ) ),
 				'source_url'     => $source_url,

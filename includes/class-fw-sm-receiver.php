@@ -604,12 +604,21 @@ class FW_SM_Receiver {
 			}
 		}
 
-		// rename() over an existing file is atomic on the same filesystem, so
-		// the destination never sees a partially replaced file.
-		if ( ! @rename( $part, $target ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+		// A replacement lands BESIDE the live file and is put in place at
+		// finalize; a file the destination does not have yet lands directly,
+		// because nothing can reference it until its callers are replaced too.
+		$landing = self::landing_path( $target );
+
+		// rename() is atomic on the same filesystem, so nothing ever observes a
+		// half-written file at either location.
+		if ( ! @rename( $part, $landing ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
 			@unlink( $part ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
 
 			$this->respond( [ 'written' => false, 'skipped' => true ] );
+		}
+
+		if ( $landing !== $target ) {
+			$this->record_staged( $session, $landing );
 		}
 
 		// Only once it is actually in place. Recording a file that failed to
@@ -642,6 +651,12 @@ class FW_SM_Receiver {
 
 		$importer = new FW_SM_Importer();
 
+		// Replacements go live here, all together, having sat beside their
+		// targets for the whole transfer. Until this moment the destination has
+		// been running exactly the files it started with, which is what makes an
+		// interrupted migration harmless rather than fatal.
+		$swap = $this->swap_staged_files( $session );
+
 		// Before the swap, and before either exit — a files-only migration
 		// finalises early and needs this just as much.
 		$pruned = $this->prune_all( $session );
@@ -650,7 +665,11 @@ class FW_SM_Receiver {
 			// Files-only migrations are legitimate; there is simply no swap.
 			$this->finish_session();
 
-			$this->respond( [ 'swapped' => 0, 'files' => (int) $session['files'] ] + $pruned + [ 'verify' => $this->verify_landed() ] );
+			$this->respond(
+				[ 'swapped' => 0, 'files' => (int) $session['files'] ]
+				+ $pruned
+				+ [ 'verify' => $this->verify_landed(), 'files_swapped' => $swap['swapped'], 'swap_failed' => $swap['failed'] ]
+			);
 		}
 
 		// Captured BEFORE the swap. Read afterwards, these would be the SOURCE's
@@ -713,7 +732,11 @@ class FW_SM_Receiver {
 			[
 				'swapped' => count( $session['tables'] ),
 				'files'   => (int) $session['files'],
-			] + $pruned + [ 'verify' => $this->verify_landed() ]
+			] + $pruned + [
+				'verify'        => $this->verify_landed(),
+				'files_swapped' => $swap['swapped'],
+				'swap_failed'   => $swap['failed'],
+			]
 		);
 	}
 
@@ -814,6 +837,23 @@ class FW_SM_Receiver {
 	private function prune_all( $session ) {
 		if ( ! empty( $session['quick'] ) ) {
 			return [ 'pruned' => 0, 'pruned_paths' => [] ];
+		}
+
+		// And not if anything failed to land.
+		//
+		// Pruning reasons backwards: whatever was not received is stale, so it
+		// goes. That is only true if everything the source sent arrived. A file
+		// that failed to write is absent from the received list for a quite
+		// different reason, and deleting the destination's existing copy of it
+		// turns a recoverable hiccup into a missing file -- which, inside a
+		// plugin, is a fatal error on a live site. Seen exactly once, and once
+		// is enough.
+		if ( ! empty( $session['skipped_files'] ) ) {
+			return [
+				'pruned'       => 0,
+				'pruned_paths' => [],
+				'prune_skipped' => (int) $session['skipped_files'],
+			];
 		}
 
 		$count = 0;
@@ -1018,7 +1058,8 @@ class FW_SM_Receiver {
 
 			// Never touch a transfer's own scratch files; a concurrent chunked
 			// write is not an orphan.
-			if ( '.fwsm-part' === substr( $entry, -10 ) ) {
+			if ( '.fwsm-part' === substr( $entry, -10 )
+				|| self::STAGED_SUFFIX === substr( $entry, -strlen( self::STAGED_SUFFIX ) ) ) {
 				$left++;
 				continue;
 			}
@@ -1048,6 +1089,191 @@ class FW_SM_Receiver {
 	 */
 	public static function prunable_stages() {
 		return [ FW_SM_Stage::THEMES, FW_SM_Stage::PLUGINS, FW_SM_Stage::MUPLUGINS ];
+	}
+
+	/**
+	 * Suffix for a replacement waiting to be put into place.
+	 *
+	 * Distinct from .fwsm-part, which is a transfer still in progress. A
+	 * .fwsm-new file is complete and verified — it is simply not live yet.
+	 */
+	const STAGED_SUFFIX = '.fwsm-new';
+
+	/**
+	 * Where to write an incoming file: over the target, or beside it.
+	 *
+	 * This is the difference between an interrupted migration being harmless
+	 * and being a fatal error on a live site.
+	 *
+	 * The database has always been safe here — it loads into `_fwsm_` tables
+	 * and swaps at the end — but files were written straight into the live
+	 * tree, one at a time. A migration that stopped partway therefore left
+	 * plugins half-updated, and half a plugin is not a degraded plugin, it is a
+	 * dead site: a new bootstrap.php requiring an include that had not arrived
+	 * yet takes down every request. Seen twice.
+	 *
+	 * The distinction that keeps this cheap: a file that does not exist on the
+	 * destination yet is safe to write immediately, because nothing references
+	 * it until the code that uses it is itself replaced. Only files that
+	 * REPLACE something have to wait, so the staging costs disk for the changed
+	 * files rather than for the whole site.
+	 *
+	 * @param string $target Absolute path the file is destined for.
+	 *
+	 * @return string Where to actually write it now.
+	 */
+	private static function landing_path( $target ) {
+		return file_exists( $target ) ? $target . self::STAGED_SUFFIX : $target;
+	}
+
+	/**
+	 * Note a replacement that is waiting to go live.
+	 *
+	 * Kept as a list rather than discovered by walking the tree at the end: a
+	 * wp-content directory is tens of thousands of files, and the swap should
+	 * cost the number of files that changed, not the number that exist.
+	 *
+	 * @param array  $session
+	 * @param string $absolute Path of the .fwsm-new file.
+	 *
+	 * @return void
+	 */
+	private function record_staged( $session, $absolute ) {
+		$path = self::staged_list_path( $session );
+
+		if ( null === $path ) {
+			return;
+		}
+
+		$handle = @fopen( $path, 'ab' ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
+
+		if ( ! $handle ) {
+			return;
+		}
+
+		fwrite( $handle, str_replace( [ "\r", "\n" ], '', $absolute ) . "\n" ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+		fclose( $handle ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+	}
+
+	/**
+	 * Where this migration's list of pending replacements lives.
+	 *
+	 * @param array $session
+	 *
+	 * @return string|null
+	 */
+	private static function staged_list_path( $session ) {
+		$id = preg_replace( '/[^a-z0-9]/i', '', (string) ( $session['migration_id'] ?? '' ) );
+
+		if ( '' === $id || ! function_exists( 'fw_upw_uploads_dir' ) ) {
+			return null;
+		}
+
+		$dir = fw_upw_uploads_dir( 'site-migration' );
+		$dir = ( $dir['path'] ?? '' ) . '/' . $id;
+
+		if ( ! wp_mkdir_p( $dir ) ) {
+			return null;
+		}
+
+		return $dir . '/staged.txt';
+	}
+
+	/**
+	 * Put every staged replacement live.
+	 *
+	 * Called at finalize, so the destination's files change only once the whole
+	 * migration has succeeded — the same guarantee the database swap gives.
+	 *
+	 * Renames are metadata operations, so thousands of them cost milliseconds
+	 * rather than the minutes a transfer takes. The window in which the site
+	 * could see a mixed set of files shrinks from the length of the migration
+	 * to the length of this loop.
+	 *
+	 * @param array $session
+	 *
+	 * @return array [ 'swapped' => int, 'failed' => string[] ]
+	 */
+	private function swap_staged_files( $session ) {
+		$path = self::staged_list_path( $session );
+
+		if ( null === $path || ! is_file( $path ) ) {
+			return [ 'swapped' => 0, 'failed' => [] ];
+		}
+
+		$handle = @fopen( $path, 'rb' ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
+
+		if ( ! $handle ) {
+			return [ 'swapped' => 0, 'failed' => [] ];
+		}
+
+		$swapped = 0;
+		$failed  = [];
+
+		while ( false !== ( $line = fgets( $handle ) ) ) { // phpcs:ignore WordPress.WP.AlternativeFunctions
+			$staged = trim( $line );
+
+			if ( '' === $staged || ! is_file( $staged ) ) {
+				continue;
+			}
+
+			$target = substr( $staged, 0, -strlen( self::STAGED_SUFFIX ) );
+
+			if ( @rename( $staged, $target ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+				$swapped++;
+				continue;
+			}
+
+			// Left in place rather than deleted: the old file is still correct,
+			// and the .fwsm-new beside it is evidence for anyone looking.
+			if ( count( $failed ) < 20 ) {
+				$failed[] = $target;
+			}
+		}
+
+		fclose( $handle ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+		@unlink( $path ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
+
+		return [ 'swapped' => $swapped, 'failed' => $failed ];
+	}
+
+	/**
+	 * Throw away replacements that never went live.
+	 *
+	 * A migration that failed leaves its staged files behind; they are worth
+	 * nothing without the rest of it, and left alone they would accumulate.
+	 *
+	 * @param array $session
+	 *
+	 * @return int How many were discarded.
+	 */
+	private function discard_staged_files( $session ) {
+		$path = self::staged_list_path( $session );
+
+		if ( null === $path || ! is_file( $path ) ) {
+			return 0;
+		}
+
+		$handle = @fopen( $path, 'rb' ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
+
+		if ( ! $handle ) {
+			return 0;
+		}
+
+		$gone = 0;
+
+		while ( false !== ( $line = fgets( $handle ) ) ) { // phpcs:ignore WordPress.WP.AlternativeFunctions
+			$staged = trim( $line );
+
+			if ( '' !== $staged && is_file( $staged ) && @unlink( $staged ) ) { // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
+				$gone++;
+			}
+		}
+
+		fclose( $handle ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+		@unlink( $path ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
+
+		return $gone;
 	}
 
 	/**
@@ -1460,6 +1686,13 @@ class FW_SM_Receiver {
 		$bytes   = 0;
 		$skipped = 0;
 
+		// WHICH files were skipped, not merely how many. The source deletes a
+		// queue job per file it believes landed, so a count alone lets a
+		// skipped file be forgotten: never retried, and never recorded as
+		// received -- which then invites the prune to delete the destination's
+		// existing copy of it.
+		$skipped_paths = [];
+
 		foreach ( $files as $file ) {
 			$relative = (string) ( $file['path'] ?? '' );
 			$target   = self::safe_target( $root, $relative );
@@ -1469,6 +1702,7 @@ class FW_SM_Receiver {
 				// a single-file transfer. Bundling must not become a way around
 				// the check.
 				$skipped++;
+				$skipped_paths[] = $relative;
 				continue;
 			}
 
@@ -1476,16 +1710,19 @@ class FW_SM_Receiver {
 
 			if ( false === $data ) {
 				$skipped++;
+				$skipped_paths[] = $relative;
 				continue;
 			}
 
 			if ( ! empty( $file['sha1'] ) && sha1( $data ) !== $file['sha1'] ) {
 				$skipped++;
+				$skipped_paths[] = $relative;
 				continue;
 			}
 
 			if ( ! wp_mkdir_p( dirname( $target ) ) ) {
 				$skipped++;
+				$skipped_paths[] = $relative;
 				continue;
 			}
 
@@ -1493,17 +1730,25 @@ class FW_SM_Receiver {
 
 			if ( false === @file_put_contents( $part, $data ) ) { // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
 				$skipped++;
+				$skipped_paths[] = $relative;
 				continue;
 			}
 
-			if ( ! @rename( $part, $target ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+			$landing = self::landing_path( $target );
+
+			if ( ! @rename( $part, $landing ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
 				@unlink( $part ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
 				$skipped++;
+				$skipped_paths[] = $relative;
 				continue;
+			}
+
+			if ( $landing !== $target ) {
+				$this->record_staged( $session, $landing );
 			}
 
 			if ( ! empty( $file['mtime'] ) ) {
-				@touch( $target, (int) $file['mtime'] ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+				@touch( $landing, (int) $file['mtime'] ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
 			}
 
 			$this->record_received( $session, $stage, $relative );
@@ -1520,7 +1765,22 @@ class FW_SM_Receiver {
 
 		update_option( self::SESSION_OPTION, $session, false );
 
-		$this->respond( [ 'written' => $written, 'bytes' => $bytes, 'skipped' => $skipped ] );
+		if ( ! empty( $skipped_paths ) ) {
+			// Remembered on the session so finalize can refuse to prune. A prune
+			// decides what to delete from what it received, and that reasoning is
+			// only sound if everything that should have arrived did.
+			$session['skipped_files'] = (int) ( $session['skipped_files'] ?? 0 ) + count( $skipped_paths );
+			update_option( self::SESSION_OPTION, $session, false );
+		}
+
+		$this->respond(
+			[
+				'written'       => $written,
+				'bytes'         => $bytes,
+				'skipped'       => $skipped,
+				'skipped_paths' => $skipped_paths,
+			]
+		);
 	}
 
 	/**
@@ -1604,7 +1864,13 @@ class FW_SM_Receiver {
 
 		$this->finish_session();
 
-		$this->respond( [ 'aborted' => true ] );
+		// Staged replacements die with the migration that produced them. Left
+		// behind they would be invisible clutter beside every file that had
+		// changed, and a later migration would have no way to tell whose they
+		// were.
+		$discarded = $this->discard_staged_files( $session );
+
+		$this->respond( [ 'aborted' => true, 'discarded' => $discarded ] );
 	}
 
 	/**

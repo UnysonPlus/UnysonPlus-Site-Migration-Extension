@@ -634,7 +634,7 @@ $tab_url = static function ( $which ) {
 										<strong><?php echo esc_html( FW_SM_Multisite::describe_mode( $resolved ) ); ?></strong>
 										<?php
 										esc_html_e(
-											'Everything it replaces on the destination is replaced in full. Inside the plugins and themes it sends, files that no longer exist here are removed there too — stale files from an older version are a common cause of fatal errors after a migration. Plugins, themes and media that exist only on the destination are left alone. The destination is only changed once the migration finishes, so an interrupted one leaves it untouched — but a completed one cannot be undone.',
+											'Everything it replaces on the destination is replaced in full. Inside the plugins and themes it sends, files that no longer exist here are removed there too — stale files from an older version are a common cause of fatal errors after a migration. Plugins, themes and media that exist only on the destination are left alone. The database is only replaced once the migration finishes, so an interrupted one leaves the destination’s data untouched. Files are different: they are written as they arrive, so a migration that stops partway can leave the destination’s plugins or themes half-updated — and a half-updated plugin can take the site down until the migration is run again. A completed migration cannot be undone.',
 											'fw'
 										);
 										?>
@@ -679,6 +679,48 @@ $tab_url = static function ( $which ) {
 													<?php endif; ?>
 												</label>
 											</p>
+
+										<?php
+										// The folders inside this stage. Offered only where there
+										// is a choice to make: a stage with one entry, or none,
+										// gets no list, because a checkbox that can only mean
+										// "yes" is noise.
+										$entries = FW_SM_Stage::is_file_stage( $stage )
+										? FW_SM_Stage::top_level( $stage, (int) ( $is_network ? get_current_blog_id() : 0 ) )
+										: [];
+										?>
+										<?php if ( count( $entries ) > 1 ) : ?>
+										<div class="fw-sm-folders" data-stage="<?php echo esc_attr( $stage ); ?>"
+										     style="margin:.1em 0 .8em 1.9em;padding:.5em .8em;border:1px solid #e0e0e0;background:#fff;max-height:12em;overflow:auto">
+											<p style="margin:0 0 .4em">
+												<a href="#" class="fw-sm-all"><?php esc_html_e( 'all', 'fw' ); ?></a>
+												&middot;
+												<a href="#" class="fw-sm-none"><?php esc_html_e( 'none', 'fw' ); ?></a>
+												<span class="description" style="margin-left:.6em">
+													<?php
+													printf(
+														/* translators: %d: number of folders. */
+														esc_html__( '%d items', 'fw' ),
+														count( $entries )
+													);
+													?>
+												</span>
+											</p>
+
+											<?php foreach ( $entries as $entry ) : ?>
+												<label style="display:block;margin:.15em 0">
+													<input type="checkbox"
+													       name="folders[<?php echo esc_attr( $stage ); ?>][]"
+													       value="<?php echo esc_attr( $entry['name'] ); ?>" checked>
+													<?php echo esc_html( $entry['name'] ); ?>
+													<?php if ( ! $entry['dir'] ) : ?>
+														<span class="description">&mdash; <?php esc_html_e( 'file', 'fw' ); ?></span>
+													<?php endif; ?>
+												</label>
+											<?php endforeach; ?>
+										</div>
+										<?php endif; ?>
+
 										<?php endforeach; ?>
 
 										<div class="notice notice-warning inline" style="margin:.8em 0 0">
@@ -712,6 +754,30 @@ $tab_url = static function ( $which ) {
 
 							<script>
 							( function () {
+								// all / none, per stage.
+								Array.prototype.forEach.call(
+									document.querySelectorAll( '.fw-sm-folders' ),
+									function ( panel ) {
+										function setAll( on ) {
+											Array.prototype.forEach.call(
+												panel.querySelectorAll( 'input[type=checkbox]' ),
+												function ( cb ) { cb.checked = on; }
+											);
+										}
+
+										var all  = panel.querySelector( '.fw-sm-all' );
+										var none = panel.querySelector( '.fw-sm-none' );
+
+										if ( all ) {
+											all.addEventListener( 'click', function ( e ) { e.preventDefault(); setAll( true ); } );
+										}
+
+										if ( none ) {
+											none.addEventListener( 'click', function ( e ) { e.preventDefault(); setAll( false ); } );
+										}
+									}
+								);
+
 								var box  = document.getElementById( 'fw-sm-quick' );
 								var opts = document.getElementById( 'fw-sm-quick-opts' );
 								if ( ! box || ! opts ) { return; }

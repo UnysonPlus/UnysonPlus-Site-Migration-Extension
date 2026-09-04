@@ -506,6 +506,23 @@ class FW_SM_Runner {
 			);
 		}
 
+		// A quick migration may name the top-level folders it wants. Expressed
+		// as exclusions for the rest, so the choice travels the same path the
+		// scanner already uses and cannot contradict it.
+		//
+		// This is why selection is worth having on top of quick mode: quick
+		// mode still WALKS every file to prove it need not send it. On a real
+		// site that is thousands of hashes to conclude nothing changed.
+		// Deselecting a folder skips the work rather than optimising it.
+		$chosen = $state['options']['folders'][ $stage ] ?? [];
+
+		if ( ! empty( $chosen ) ) {
+			$excludes = array_merge(
+				$excludes,
+				FW_SM_Stage::excludes_for_selection( $stage, $chosen, (int) ( $state['options']['source_blog_id'] ?? 0 ) )
+			);
+		}
+
 		$scanner = new FW_SM_File_Scanner( $stage, $root, $excludes );
 
 		$stack_key = 'scan_stack_' . $stage;
@@ -680,6 +697,37 @@ class FW_SM_Runner {
 			)
 		);
 
+		// Files held back for the whole transfer go live in one pass here, so
+		// the count is worth stating: it is the number of files the destination
+		// was still running the old version of until a moment ago.
+		$swapped_files = (int) ( $result['files_swapped'] ?? 0 );
+
+		if ( $swapped_files > 0 ) {
+			FW_SM_State::log(
+				sprintf(
+					/* translators: %d: number of files. */
+					_n(
+						'%d replaced file was put in place.',
+						'%d replaced files were put in place, all at once, so the destination never ran a half-updated plugin.',
+						$swapped_files,
+						'fw'
+					),
+					$swapped_files
+				)
+			);
+		}
+
+		if ( ! empty( $result['swap_failed'] ) ) {
+			FW_SM_State::log(
+				sprintf(
+					/* translators: 1: count, 2: example paths. */
+					__( 'Warning: %1$d file(s) could not be put in place and the destination is still running its old copy of them. For example: %2$s', 'fw' ),
+					count( (array) $result['swap_failed'] ),
+					implode( ', ', array_slice( (array) $result['swap_failed'], 0, 3 ) )
+				)
+			);
+		}
+
 		// "Finished" is not the same as "works". The destination reports back
 		// what it can actually READ, because every failure mode that survives
 		// to this point is silent by nature.
@@ -720,6 +768,19 @@ class FW_SM_Runner {
 		// Deleting files on someone else's live server is not something to do
 		// quietly, so it is always named — with examples, since "removed 41
 		// files" on its own is not something anyone can check.
+		// Said out loud when it declines. Silence here would leave stale files
+		// in place with no indication why, which is the sort of thing that only
+		// surfaces months later as a fatal error.
+		if ( ! empty( $result['prune_skipped'] ) ) {
+			FW_SM_State::log(
+				sprintf(
+					/* translators: %d: number of files. */
+					__( 'Stale files were NOT removed from the destination: %d file(s) failed to write, so what it holds cannot be judged against what it received. Run the migration again once those succeed.', 'fw' ),
+					(int) $result['prune_skipped']
+				)
+			);
+		}
+
 		$pruned = (int) ( $result['pruned'] ?? 0 );
 
 		if ( $pruned > 0 ) {
@@ -1050,7 +1111,8 @@ class FW_SM_Runner {
 		// over a long round trip is limited by its window rather than by the
 		// link, so filling several at the same time is the difference between
 		// a link that is busy and one that spends most of its time waiting.
-		$streams = self::stream_count();
+		// Capped by anything a capacity failure has since taught us.
+		$streams = min( self::stream_count(), (int) FW_SM_State::cursor( 'stream_cap', self::stream_count() ) );
 
 		$bundles     = [];
 		$bundle_ids  = [];
@@ -1140,11 +1202,34 @@ class FW_SM_Runner {
 				}
 
 				// The sender may have packed fewer than offered, once the byte
-				// cap was reached. Only those are done.
+				// cap was reached. Only those were even attempted.
 				$done = (int) ( $result['sent_files'] ?? count( $group ) );
 
+				// Attempted is not the same as written. The destination skips a
+				// file it could not place -- an unwritable directory, a failed
+				// rename -- and names each one. Clearing those jobs anyway would
+				// drop the file silently: never retried, and absent from the
+				// received list, which then invites the prune to delete the copy
+				// already on the destination. They stay queued instead.
+				$lost = array_flip( (array) ( $result['skipped_paths'] ?? [] ) );
+
 				for ( $j = 0; $j < $done; $j++ ) {
+					if ( isset( $lost[ $group[ $j ]['path'] ?? '' ] ) ) {
+						continue;
+					}
+
 					FW_SM_Queue::delete( $bundle_ids[ $i ][ $j ] );
+				}
+
+				if ( ! empty( $result['skipped_paths'] ) ) {
+					FW_SM_State::log(
+						sprintf(
+							/* translators: 1: count, 2: example paths. */
+							__( 'The destination could not write %1$d file(s); they stay queued for another attempt. For example: %2$s', 'fw' ),
+							count( (array) $result['skipped_paths'] ),
+							implode( ', ', array_slice( (array) $result['skipped_paths'], 0, 3 ) )
+						)
+					);
 				}
 
 				$bytes += (int) ( $result['bytes'] ?? 0 );
@@ -1158,7 +1243,7 @@ class FW_SM_Runner {
 			if ( null !== $failure ) {
 				// Attributed to a job that is still queued, so the retry
 				// counter has somewhere to live.
-				$retry = $this->maybe_retry_job( [ 'id' => $failed_first, 'bytes' => 0 ], $failure );
+				$retry = $this->maybe_retry_job( [ 'id' => $failed_first, 'bytes' => 0, 'stage' => $stage ], $failure );
 
 				if ( is_wp_error( $retry ) ) {
 					return $retry;
@@ -1355,6 +1440,40 @@ class FW_SM_Runner {
 		// for what the IMPORT of it costs, which is several times the bytes on
 		// the wire.
 		if ( self::is_capacity_error( $error ) ) {
+			// A file stage does not read batch_ceiling -- bundles are sized by
+			// BUNDLE_BYTES and chunks by CHUNK_BYTES -- so shrinking it there
+			// achieves nothing at all. It was observed walking 8 MB down to the
+			// 256 KB floor while the Plugins stage failed identically at every
+			// size, because the number being reduced was never consulted.
+			//
+			// What a file stage can give back is concurrency: several requests
+			// in flight means several PHP processes on the destination at once,
+			// and shared hosts cap the account, not just the process.
+			// The job carries its own stage, which is exactly the one that failed.
+			$stage = (string) ( $job['stage'] ?? '' );
+
+			if ( FW_SM_Stage::DATABASE !== $stage ) {
+				$streams = (int) FW_SM_State::cursor( 'stream_cap', self::stream_count() );
+
+				if ( $streams > 1 ) {
+					$fewer = max( 1, (int) floor( $streams / 2 ) );
+
+					FW_SM_State::set_cursor( [ 'stream_cap' => $fewer ] );
+					FW_SM_Queue::reset_attempts( $job['id'] );
+
+					FW_SM_State::log(
+						sprintf(
+							/* translators: 1: previous count, 2: new count. */
+							__( 'The destination ran out of memory. Sending fewer files at once — %1$d down to %2$d.', 'fw' ),
+							$streams,
+							$fewer
+						)
+					);
+
+					return true;
+				}
+			}
+
 			$before = self::batch_ceiling();
 			$after  = max( self::MIN_BATCH_BYTES, (int) ( $before / 2 ) );
 
