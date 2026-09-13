@@ -604,10 +604,10 @@ class FW_SM_Receiver {
 			}
 		}
 
-		// A replacement lands BESIDE the live file and is put in place at
-		// finalize; a file the destination does not have yet lands directly,
-		// because nothing can reference it until its callers are replaced too.
-		$landing = self::landing_path( $target );
+		// Where the file lands now: beside the live copy as .fwsm-new for a
+		// code stage (swapped in at finalize) or a replacement elsewhere,
+		// otherwise straight to its final path. See landing_path().
+		$landing = self::landing_path( $target, $stage );
 
 		// rename() is atomic on the same filesystem, so nothing ever observes a
 		// half-written file at either location.
@@ -655,6 +655,29 @@ class FW_SM_Receiver {
 		// targets for the whole transfer. Until this moment the destination has
 		// been running exactly the files it started with, which is what makes an
 		// interrupted migration harmless rather than fatal.
+		// Nothing goes live unless every received file is genuinely on disk.
+		// A migration that finishes with a file absent is not a finished
+		// migration — it is a site that will fatal on its next request, and
+		// the destination on its old, complete files is strictly better than
+		// that. Refused as a decision (HTTP 400), not a hiccup, so the source
+		// reports it rather than retrying an outcome that cannot change.
+		$missing = $this->verify_received( $session );
+
+		if ( ! empty( $missing ) ) {
+			$this->discard_staged_files( $session );
+			FW_SM_Importer::drop_staging_tables();
+
+			$this->fail(
+				sprintf(
+					/* translators: 1: count, 2: example paths. */
+					__( 'Refusing to finish: %1$d file(s) the destination received are no longer on its disk, so putting the rest live would leave the site broken. Nothing was changed. Something on the destination is removing files after they are written — a malware scanner or a disk quota are the usual causes. For example: %2$s', 'fw' ),
+					count( $missing ),
+					implode( ', ', array_slice( $missing, 0, 5 ) )
+				),
+				400
+			);
+		}
+
 		$swap = $this->swap_staged_files( $session );
 
 		// Before the swap, and before either exit — a files-only migration
@@ -1122,7 +1145,27 @@ class FW_SM_Receiver {
 	 *
 	 * @return string Where to actually write it now.
 	 */
-	private static function landing_path( $target ) {
+	private static function landing_path( $target, $stage ) {
+		// In a code stage EVERY file waits — new files as much as replacements.
+		//
+		// The original rule staged only replacements, on the reasoning that a
+		// file the destination did not have yet is harmless until the code that
+		// references it is swapped in. That holds for a new file added to an
+		// existing extension, but not for a whole new extension: its files are
+		// ALL new, they land directly, and the framework discovers extensions
+		// by scanning the folder — so a half-arrived new extension is loaded
+		// mid-migration, before finalize, and a required include that has not
+		// arrived yet fatals the live site. Staging the whole set behind
+		// .fwsm-new keeps it invisible to WordPress and the framework until the
+		// atomic swap. (This is the asset-optimizer fatal, and two before it.)
+		if ( in_array( $stage, self::prunable_stages(), true ) ) {
+			return $target . self::STAGED_SUFFIX;
+		}
+
+		// Elsewhere — uploads, loose wp-content files — only a replacement
+		// waits. A new image or data file is not auto-loaded by anything, so it
+		// is safe the moment it lands, and staging the bulk of a site's uploads
+		// would double the disk a migration needs for no safety gained.
 		return file_exists( $target ) ? $target . self::STAGED_SUFFIX : $target;
 	}
 
@@ -1177,6 +1220,78 @@ class FW_SM_Receiver {
 		}
 
 		return $dir . '/staged.txt';
+	}
+
+	/**
+	 * Confirm every file the destination said it received is actually on disk.
+	 *
+	 * "Received" is recorded the moment a write succeeds. That is the right
+	 * moment to record it and the wrong moment to trust it: a file can be
+	 * removed again before finalize by something this code never sees — a
+	 * malware scanner on shared hosting quarantining a PHP file it dislikes, a
+	 * disk quota tripping mid-transfer, an older build on the far side that
+	 * lost a skipped write silently. Three separate live sites have gone down
+	 * with a new plugin file requiring an include that was not there, and in
+	 * every case the migration had reported success.
+	 *
+	 * So before anything goes live the received lists are walked and each entry
+	 * checked for — either in place already (a new file) or waiting as a staged
+	 * replacement. Anything missing means the swap must not happen: a site on
+	 * its OLD, complete files works; a site on NEW files with one absent does
+	 * not.
+	 *
+	 * Only the code stages are checked. A missing upload is a broken image;
+	 * a missing include is a dead site.
+	 *
+	 * @param array $session
+	 *
+	 * @return string[] Relative paths (stage-prefixed) that are not on disk.
+	 */
+	private function verify_received( $session ) {
+		$missing = [];
+
+		foreach ( self::prunable_stages() as $stage ) {
+			$path = self::manifest_path( $session, $stage );
+			$root = FW_SM_Stage::destination_dir( $stage, (int) ( $session['dest_blog_id'] ?? 0 ) );
+
+			if ( null === $path || null === $root || ! is_file( $path ) ) {
+				continue;
+			}
+
+			$handle = @fopen( $path, 'rb' ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
+
+			if ( ! $handle ) {
+				continue;
+			}
+
+			while ( false !== ( $line = fgets( $handle ) ) ) { // phpcs:ignore WordPress.WP.AlternativeFunctions
+				$relative = trim( $line );
+
+				if ( '' === $relative ) {
+					continue;
+				}
+
+				$target = self::safe_target( $root, $relative );
+
+				if ( null === $target ) {
+					continue;
+				}
+
+				clearstatcache( true, $target );
+
+				if ( is_file( $target ) || is_file( $target . self::STAGED_SUFFIX ) ) {
+					continue;
+				}
+
+				if ( count( $missing ) < 200 ) {
+					$missing[] = $stage . '/' . $relative;
+				}
+			}
+
+			fclose( $handle ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+		}
+
+		return $missing;
 	}
 
 	/**
@@ -1734,7 +1849,7 @@ class FW_SM_Receiver {
 				continue;
 			}
 
-			$landing = self::landing_path( $target );
+			$landing = self::landing_path( $target, $stage );
 
 			if ( ! @rename( $part, $landing ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
 				@unlink( $part ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged

@@ -67,7 +67,23 @@ $tab_url = static function ( $which ) {
 ?>
 <div class="wrap fw-ext-site-migration">
 
-	<h1><?php esc_html_e( 'Site Migration', 'fw' ); ?></h1>
+	<h1>
+		<?php esc_html_e( 'Site Migration', 'fw' ); ?>
+		<span class="fw-sm-beta"
+		      style="display:inline-block;vertical-align:middle;margin-left:.5em;padding:.15em .55em;border-radius:3px;background:#f0b849;color:#1d2327;font-size:12px;font-weight:600;line-height:1.6;letter-spacing:.02em;text-transform:uppercase;"
+		      title="<?php esc_attr_e( 'This extension is new and still being refined — always keep a backup of the destination before you migrate.', 'fw' ); ?>">
+			<?php esc_html_e( 'Beta', 'fw' ); ?>
+		</span>
+	</h1>
+
+	<p class="description" style="margin:-.4em 0 1.2em;max-width:52em">
+		<?php
+		esc_html_e(
+			'Site Migration is in beta. It works, but expect the occasional rough edge — always take a backup of the destination before migrating, and update the extension on both sites so they match.',
+			'fw'
+		);
+		?>
+	</p>
 
 	<?php if ( $notice ) : ?>
 		<div class="notice notice-<?php echo 'success' === ( $notice['type'] ?? 'error' ) ? 'success' : 'error'; ?>">
