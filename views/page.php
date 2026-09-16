@@ -1813,6 +1813,30 @@ $tab_url = static function ( $which ) {
 						</p>
 					<?php endif; ?>
 
+					<hr style="margin:2em 0">
+
+					<h3 style="margin-bottom:.25em"><?php esc_html_e( 'Leftover staged files', 'fw' ); ?></h3>
+
+					<p class="description" style="max-width:46em">
+						<?php
+						esc_html_e(
+							'A migration writes each replacement beside its live file as a .fwsm-new until the moment it goes live. A cancelled or refused migration can leave those behind. This deletes every .fwsm-new / .fwsm-part on this site right now — the live files are never touched, so anything that could not be replaced simply keeps its old, working copy. (Every migration already does this automatically at its start.)',
+							'fw'
+						);
+						?>
+					</p>
+
+					<p>
+						<?php
+						$action_form(
+							FW_Extension_Site_Migration::ACTION_PURGE,
+							__( 'Delete leftover staged files', 'fw' ),
+							'button',
+							__( 'Delete every leftover .fwsm-new / .fwsm-part on this site? The live files are not touched — only the staged copies are removed.', 'fw' )
+						);
+						?>
+					</p>
+
 					<script>
 					( function () {
 						var btn = document.getElementById( 'fw-sm-copy' );

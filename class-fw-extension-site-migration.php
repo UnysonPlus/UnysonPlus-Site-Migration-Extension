@@ -37,6 +37,7 @@ class FW_Extension_Site_Migration extends FW_Extension {
 	const ACTION_DISMISS    = 'fw_sm_dismiss';
 	const ACTION_RESET_KEY  = 'fw_sm_reset_key';
 	const ACTION_CLEAR_IN   = 'fw_sm_clear_incoming';
+	const ACTION_PURGE      = 'fw_sm_purge_staged';
 	const ACTION_RECHECK    = 'fw_sm_recheck';
 	const ACTION_DIAGNOSE   = 'fw_sm_diagnose';
 	const ACTION_INSPECT    = 'fw_sm_inspect';
@@ -97,6 +98,7 @@ class FW_Extension_Site_Migration extends FW_Extension {
 				self::ACTION_DISMISS,
 				self::ACTION_RESET_KEY,
 				self::ACTION_CLEAR_IN,
+				self::ACTION_PURGE,
 				self::ACTION_RECHECK,
 				self::ACTION_DIAGNOSE,
 				self::ACTION_INSPECT,
@@ -1003,6 +1005,35 @@ class FW_Extension_Site_Migration extends FW_Extension {
 
 		$this->redirect_with_notice(
 			__( 'Cleared. This site can receive a migration again.', 'fw' ),
+			'success',
+			'destination'
+		);
+	}
+
+	/**
+	 * Force-delete every leftover staged file on this (destination) site.
+	 *
+	 * @return void
+	 * @handles admin_post_fw_sm_purge_staged
+	 */
+	public function handle_purge_staged() {
+		$this->guard( self::ACTION_PURGE );
+
+		$removed = FW_SM_Receiver::purge_staged_files();
+
+		$this->redirect_with_notice(
+			$removed > 0
+				? sprintf(
+					/* translators: %d: number of files removed. */
+					_n(
+						'Deleted %d leftover staged file. The live files were not touched.',
+						'Deleted %d leftover staged files. The live files were not touched.',
+						$removed,
+						'fw'
+					),
+					$removed
+				)
+				: __( 'No leftover staged files were found — nothing to delete.', 'fw' ),
 			'success',
 			'destination'
 		);

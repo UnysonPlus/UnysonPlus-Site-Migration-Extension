@@ -1418,11 +1418,24 @@ class FW_SM_Receiver {
 				continue;
 			}
 
-			// Genuinely could not be put in place by either route. Left as it is
-			// — the old file is still correct, and the .fwsm-new beside it is
-			// evidence. The full count is kept even though only a few are named,
-			// so the log states the true scale rather than the example cap.
+			// Genuinely could not be put in place by either route — the change
+			// does not go live, and that is reported. What must NOT happen is the
+			// staged copy lingering: a host that refuses these overwrites refuses
+			// them every migration, so left alone they pile straight back up and
+			// the site owner is made to delete them by hand after every run.
+			//
+			// So clean the leftover here — but only when the live file is still
+			// present. Its presence means this was a REPLACEMENT: the old, working
+			// copy is in place, and the .fwsm-new beside it is pure clutter, safe
+			// to drop. If the target is absent instead, this was a NEW file that
+			// could not be placed, and deleting its only copy would leave the
+			// destination missing a file something may require — so that one is
+			// kept, and the after-scan still reports it.
 			$failed_count++;
+
+			if ( is_file( $target ) ) {
+				@unlink( $staged ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
+			}
 
 			if ( count( $failed ) < 20 ) {
 				$failed[] = $target;
@@ -2246,6 +2259,24 @@ class FW_SM_Receiver {
 		FW_SM_Importer::drop_staging_tables();
 
 		delete_option( self::SESSION_OPTION );
+	}
+
+	/**
+	 * Delete every leftover staged file on this site, on demand.
+	 *
+	 * The same sweep a migration runs automatically at its start, exposed as a
+	 * button on the Destination tab for when a person wants the clutter gone
+	 * without waiting for the next migration. It removes only the staged copies
+	 * (.fwsm-new / .fwsm-part) — the live files are never touched — so a file
+	 * the destination refused to overwrite simply goes back to showing its old,
+	 * working copy with no half-updated debris beside it.
+	 *
+	 * @return int How many staged files were removed.
+	 */
+	public static function purge_staged_files() {
+		$examples = [];
+
+		return ( new self() )->sweep_staged_files( true, $examples );
 	}
 
 	/**

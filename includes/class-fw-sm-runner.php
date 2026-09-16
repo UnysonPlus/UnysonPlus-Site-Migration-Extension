@@ -745,7 +745,7 @@ class FW_SM_Runner {
 			FW_SM_State::log(
 				sprintf(
 					/* translators: 1: count, 2: example paths. */
-					__( 'Warning: %1$d file(s) could not be put in place and the destination is still running its old copy of them. For example: %2$s', 'fw' ),
+					__( 'Warning: %1$d file(s) could not be put in place — the destination is read-only for those paths, so they keep their old copy. Their leftover staged copies were removed automatically, so nothing is left to clean up by hand. For example: %2$s', 'fw' ),
 					$swap_failed_count,
 					implode( ', ', array_slice( (array) ( $result['swap_failed'] ?? [] ), 0, 3 ) )
 				)
@@ -767,7 +767,7 @@ class FW_SM_Runner {
 					implode( ', ', array_slice( (array) ( $result['left_example'] ?? [] ), 0, 3 ) )
 				)
 			);
-		} elseif ( isset( $result['staged_left'] ) ) {
+		} elseif ( isset( $result['staged_left'] ) && 0 === $swap_failed_count ) {
 			FW_SM_State::log(
 				__( 'Checked the destination: no leftover staged files — every replacement is live.', 'fw' )
 			);

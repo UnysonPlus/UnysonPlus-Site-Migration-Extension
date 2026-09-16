@@ -145,6 +145,31 @@ check( 'when rename is refused, copy-in-place takes over', swap_one( "$root/them
 check( 'the change still goes live', file_get_contents( "$root/themes/child/view.php" ), 'NEW via copy' );
 check( 'and the staged copy is cleaned up', file_exists( "$root/themes/child/view.php.fwsm-new" ), false );
 
+echo "\n-- a swap the host refuses does not leave clutter behind --\n";
+// Mirrors the finalize cleanup: when neither rename nor copy can place the file,
+// the leftover .fwsm-new is removed IF the live file is still there (a
+// replacement whose old copy is correct), and KEPT if the target is absent (a
+// new file whose only copy must not be lost).
+function swap_or_clean( $staged, $target, $can_write ) {
+	if ( $can_write && @copy( $staged, $target ) ) { @unlink( $staged ); return 'live'; }
+	// Could not place it. Clean the leftover only when the live file remains.
+	if ( is_file( $target ) ) { @unlink( $staged ); return 'failed-cleaned'; }
+	return 'failed-kept';
+}
+
+rrm( $root );
+// A replacement the host refuses: the old file is present, so the leftover goes.
+put( "$root/themes/child/locked.php", 'OLD, host will not let us overwrite' );
+put( "$root/themes/child/locked.php.fwsm-new", 'NEW, refused' );
+check( 'a refused replacement is reported failed', swap_or_clean( "$root/themes/child/locked.php.fwsm-new", "$root/themes/child/locked.php", false ), 'failed-cleaned' );
+check( 'its leftover .fwsm-new is auto-removed', file_exists( "$root/themes/child/locked.php.fwsm-new" ), false );
+check( 'and the live file is untouched', file_get_contents( "$root/themes/child/locked.php" ), 'OLD, host will not let us overwrite' );
+
+// A NEW file that could not be placed: keep it, or the destination loses a file.
+put( "$root/themes/child/brandnew.php.fwsm-new", 'a new file that failed to land' );
+check( 'a refused NEW file keeps its staged copy', swap_or_clean( "$root/themes/child/brandnew.php.fwsm-new", "$root/themes/child/brandnew.php", false ), 'failed-kept' );
+check( 'so nothing that only exists as .fwsm-new is lost', file_exists( "$root/themes/child/brandnew.php.fwsm-new" ), true );
+
 rrm( $root );
 
 echo "\n========================================\n";

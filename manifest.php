@@ -11,7 +11,7 @@ $manifest['description'] = __(
 	'fw'
 );
 
-$manifest['version']    = '1.0.27';
+$manifest['version']    = '1.0.29';
 $manifest['display']    = true;
 $manifest['standalone'] = true;
 $manifest['thumbnail']  = 'thumbnail.svg';
@@ -34,6 +34,17 @@ $manifest['requires_wp']  = '5.8';
 /**
  * Changelog
  * -----------------------------------------------------------------------------
+ * 1.0.29 - Finalize now cleans up after itself. When the destination cannot put
+ *          a staged replacement in place (a managed host that refuses to
+ *          overwrite certain existing files, so both the rename and the
+ *          copy-in-place fallback are refused), the leftover .fwsm-new is
+ *          removed there and then — but only where the live file is still
+ *          present, so a replacement drops its clutter while a new file that
+ *          could not land keeps its only copy. A host that refuses the same
+ *          files every migration no longer forces the site owner to delete the
+ *          pile by hand after every run. A manual "Delete leftover staged files"
+ *          button on the Destination tab remains for cleaning up on demand.
+ *
  * 1.0.26 - Automatic leftover-staged-file detection, before and after every
  *          migration. A replacement is written beside its live file as a
  *          .fwsm-new and only renamed into place at finalize; a run that is
