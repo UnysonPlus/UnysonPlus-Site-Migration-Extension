@@ -1211,23 +1211,44 @@ class FW_SM_Runner {
 				// drop the file silently: never retried, and absent from the
 				// received list, which then invites the prune to delete the copy
 				// already on the destination. They stay queued instead.
-				$lost = array_flip( (array) ( $result['skipped_paths'] ?? [] ) );
+				$lost    = array_flip( (array) ( $result['skipped_paths'] ?? [] ) );
+				$gave_up = [];
 
 				for ( $j = 0; $j < $done; $j++ ) {
-					if ( isset( $lost[ $group[ $j ]['path'] ?? '' ] ) ) {
+					$path = $group[ $j ]['path'] ?? '';
+					$id   = $bundle_ids[ $i ][ $j ];
+
+					if ( isset( $lost[ $path ] ) ) {
+						// A skip is retried a few times — it can be a transient
+						// hiccup — but some destinations refuse a path PERMANENTLY: a
+						// managed host blocks writes to its own cache and mu-plugin
+						// directories, and no number of retries will place them. Left
+						// re-queued forever, those files leave the migration stuck at
+						// 100% with a queue that never drains. So each skip counts
+						// against the same MAX_ATTEMPTS budget as any other failure,
+						// and once it is spent the file is given up and dropped from
+						// the queue so the rest of the migration can finish.
+						if ( FW_SM_Queue::bump_attempts( $id ) >= self::MAX_ATTEMPTS ) {
+							FW_SM_Queue::delete( $id );
+							$gave_up[] = $path;
+						}
+
 						continue;
 					}
 
-					FW_SM_Queue::delete( $bundle_ids[ $i ][ $j ] );
+					FW_SM_Queue::delete( $id );
 				}
 
-				if ( ! empty( $result['skipped_paths'] ) ) {
+				// Only the give-up is worth a log line. The plain "still retrying"
+				// case used to log every pass, which on a permanently-refused set
+				// buried the whole log in the same sentence hundreds of times.
+				if ( ! empty( $gave_up ) ) {
 					FW_SM_State::log(
 						sprintf(
 							/* translators: 1: count, 2: example paths. */
-							__( 'The destination could not write %1$d file(s); they stay queued for another attempt. For example: %2$s', 'fw' ),
-							count( (array) $result['skipped_paths'] ),
-							implode( ', ', array_slice( (array) $result['skipped_paths'], 0, 3 ) )
+							__( 'Gave up on %1$d file(s) the destination would not write after several tries — the migration will finish without them. This is normal on a managed host that blocks writes to certain folders. For example: %2$s', 'fw' ),
+							count( $gave_up ),
+							implode( ', ', array_slice( $gave_up, 0, 3 ) )
 						)
 					);
 				}
@@ -1288,6 +1309,34 @@ class FW_SM_Runner {
 			}
 
 			$bytes += (int) ( $result['sent_bytes'] ?? 0 );
+
+			// The destination took the request but could not place the file — an
+			// unwritable path, the same refusal a bundle can hit. Without a cap
+			// this would reset to offset 0 and try forever; with one, a few
+			// attempts then give up, so a single refused large file cannot stall
+			// the whole migration.
+			if ( ! empty( $result['skipped'] ) && empty( $result['written'] ) && empty( $result['done'] ) ) {
+				if ( FW_SM_Queue::bump_attempts( $job['id'] ) >= self::MAX_ATTEMPTS ) {
+					FW_SM_Queue::delete( $job['id'] );
+					FW_SM_State::set_cursor( [ $offset_key => null ] );
+					$skipped++;
+
+					FW_SM_State::log(
+						sprintf(
+							/* translators: %s: file path. */
+							__( 'Gave up on %s — the destination would not write it. The migration will finish without it.', 'fw' ),
+							$relative
+						)
+					);
+
+					break;
+				}
+
+				// Not yet spent: start the next attempt from the beginning.
+				FW_SM_State::set_cursor( [ $offset_key => 0 ] );
+
+				return [ 'processed_bytes' => $bytes, 'complete' => false ];
+			}
 
 			if ( empty( $result['done'] ) || ! empty( $result['resync'] ) ) {
 				$next = isset( $result['at'] )

@@ -62,6 +62,9 @@ class FW_Extension_Site_Migration extends FW_Extension {
 	/** Where the source remembers the destination it is connected to. */
 	const DESTINATION_OPTION = 'fw_sm_destination';
 
+	/** Per-destination memory of the last migration: its timing and its selection. */
+	const PROFILE_OPTION     = 'fw_sm_profiles';
+
 	/** @var string|null */
 	private $page_hook = null;
 
@@ -439,6 +442,42 @@ class FW_Extension_Site_Migration extends FW_Extension {
 	 * @return void
 	 * @handles admin_post_fw_sm_migrate
 	 */
+	/**
+	 * The last migration recorded for a destination, or null.
+	 *
+	 * @param string $url
+	 *
+	 * @return array|null [ 'at', 'url', 'mode', 'target', 'stages', 'folders' ]
+	 */
+	public static function last_migration( $url ) {
+		$all = get_option( self::PROFILE_OPTION, [] );
+		$key = md5( untrailingslashit( (string) $url ) );
+
+		return is_array( $all ) && isset( $all[ $key ] ) && is_array( $all[ $key ] )
+			? $all[ $key ]
+			: null;
+	}
+
+	/**
+	 * Record the migration just started, keyed by destination.
+	 *
+	 * @param string $url
+	 * @param array  $data
+	 *
+	 * @return void
+	 */
+	private static function remember_migration( $url, array $data ) {
+		$all = get_option( self::PROFILE_OPTION, [] );
+
+		if ( ! is_array( $all ) ) {
+			$all = [];
+		}
+
+		$all[ md5( untrailingslashit( (string) $url ) ) ] = $data;
+
+		update_option( self::PROFILE_OPTION, $all, false );
+	}
+
 	public function handle_migrate() {
 		$this->guard( self::ACTION_MIGRATE );
 
@@ -576,6 +615,21 @@ class FW_Extension_Site_Migration extends FW_Extension {
 		if ( is_wp_error( $result ) ) {
 			$this->redirect_with_notice( $result->get_error_message() );
 		}
+
+		// Remember what this push was, so returning to the same destination can
+		// repeat it in one click — the dev-to-live loop is the same selection
+		// over and over, and re-picking it each time is the tax this removes.
+		self::remember_migration(
+			$destination['url'],
+			[
+				'at'      => time(),
+				'url'     => untrailingslashit( (string) $destination['url'] ),
+				'mode'    => $quick ? 'choose' : 'whole',
+				'target'  => (string) $target,
+				'stages'  => $quick ? array_values( $chosen ) : [],
+				'folders' => $folders,
+			]
+		);
 
 		wp_safe_redirect( self::get_page_url() );
 		exit;

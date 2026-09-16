@@ -97,6 +97,51 @@ check( 'a plugins failure halves the streams', capacity_response( 'plugins', 8 )
 check( 'and again', capacity_response( 'plugins', 4 ), [ 'shrink' => 'streams', 'to' => 2 ] );
 check( 'at one stream it falls back to the batch', capacity_response( 'plugins', 1 ), [ 'shrink' => 'batch' ] );
 
+// --- giving up on a permanently-refused file so the queue can drain ---
+// A managed host refuses writes to certain folders forever. Left re-queued,
+// such a file leaves the migration stuck at 100% with a queue that never
+// empties. So each skip counts against MAX_ATTEMPTS and is dropped once spent.
+define( 'MAX_ATTEMPTS', 3 );
+
+// The decision both paths now make on a skip: bump the attempt, and only give
+// up (drop from the queue) once the budget is spent.
+function skip_outcome( $attempts_before ) {
+	$attempts = $attempts_before + 1; // bump_attempts() returns the new count.
+	return $attempts >= MAX_ATTEMPTS ? 'give_up' : 'retry';
+}
+
+echo "\n-- a skip is retried until its attempts are spent, then given up --\n";
+check( 'first skip retries', skip_outcome( 0 ), 'retry' );
+check( 'second skip retries', skip_outcome( 1 ), 'retry' );
+check( 'third skip gives up', skip_outcome( 2 ), 'give_up' );
+
+echo "\n-- a permanently-refused file cannot loop forever --\n";
+// Simulate the runner re-visiting the same refused job pass after pass. Without
+// a cap this never terminates; with one it drops the file within MAX_ATTEMPTS.
+$attempts = 0;
+$passes   = 0;
+while ( 'retry' === skip_outcome( $attempts ) ) {
+	$attempts++;
+	$passes++;
+	if ( $passes > 100 ) { break; } // guard: an unbounded loop would hit this.
+}
+check( 'the loop terminates', $passes <= 100, true );
+check( 'it gives up within MAX_ATTEMPTS passes', $passes, MAX_ATTEMPTS - 1 );
+
+echo "\n-- the chunked receiver records a skip so the prune stays off --\n";
+// handle_file now calls note_skip() before each terminal skip response, exactly
+// as handle_bundle records skipped_files. A single refused large file must
+// therefore disable the prune the same way a refused small one does.
+function receiver_after_chunk_skip( array $session ) {
+	$session['skipped_files'] = (int) ( $session['skipped_files'] ?? 0 ) + 1;
+	return $session;
+}
+check(
+	'a chunked skip stops the prune',
+	may_prune( receiver_after_chunk_skip( [ 'quick' => false ] ) ),
+	false
+);
+
 echo "\n========================================\n";
 echo "  $pass passed, $fail failed\n";
 exit( $fail > 0 ? 1 : 0 );

@@ -642,7 +642,7 @@ $tab_url = static function ( $which ) {
 								</script>
 							<?php endif; ?>
 
-							<div class="notice notice-warning inline" style="margin:0 0 1.2em">
+							<div id="fw-sm-full-warning" class="notice notice-warning inline" style="margin:0 0 1.2em">
 								<p style="max-width:46em">
 									<?php if ( is_wp_error( $resolved ) ) : ?>
 										<?php echo esc_html( $resolved->get_error_message() ); ?>
@@ -658,99 +658,153 @@ $tab_url = static function ( $which ) {
 								</p>
 							</div>
 
-							<div class="postbox" style="margin:0 0 1.2em;box-shadow:none;border-color:#dcdcde">
-								<div class="inside" style="margin-bottom:0">
-									<p style="margin:.2em 0 .8em">
-										<label style="font-weight:600">
-											<input type="checkbox" name="quick" id="fw-sm-quick" value="1">
-											<?php esc_html_e( 'Quick migration — only send what has changed', 'fw' ); ?>
-										</label>
-									</p>
-									<p class="description" style="max-width:46em;margin:0 0 .8em">
-										<?php
-										esc_html_e(
-											'Files the destination already has, byte-for-byte, are skipped. The result is the same as a full migration, it just does not re-send what is already there — which on a second push is nearly everything.',
-											'fw'
-										);
+							<?php
+							// What to send. Two modes, mapped onto the existing
+							// backend contract so the transfer path is untouched:
+							//
+							//   whole  — the full migration. `quick` is NOT
+							//            submitted, so the handler runs every stage
+							//            and prunes, exactly as before.
+							//   choose — selective. Submits `quick=1` plus the
+							//            per-stage `stages[]` and `folders[STAGE][]`
+							//            the handler already understands.
+							//
+							// The cards are a nicer face on the old "Quick
+							// migration -> Include" box; nothing server-side changed.
+							$file_stages = array_values( array_filter(
+								FW_SM_Stage::all(),
+								static function ( $s ) { return FW_SM_Stage::FINALIZE !== $s; }
+							) );
+							?>
+
+							<input type="hidden" name="quick" id="fw-sm-quick" value="">
+
+							<?php
+							// The last push to THIS destination, if there was one.
+							// Shown as a recency line plus a one-click "repeat",
+							// which applies the saved mode / stages / folders to the
+							// form below without submitting — the user still sees
+							// what it will do and presses Migrate themselves.
+							$last = FW_Extension_Site_Migration::last_migration( $destination['url'] );
+							?>
+							<?php if ( is_array( $last ) && ! empty( $last['at'] ) ) : ?>
+								<p class="fw-sm-last" style="margin:.2em 0 1.2em;color:#50575e">
+									<span class="dashicons dashicons-backup" style="vertical-align:text-bottom;color:#787c82"></span>
+									<?php
+									printf(
+										/* translators: %s: human-readable duration. */
+										esc_html__( 'Last migration to this destination: %s ago.', 'fw' ),
+										esc_html( human_time_diff( (int) $last['at'] ) )
+									);
+									?>
+									<?php if ( 'choose' === ( $last['mode'] ?? 'whole' ) ) : ?>
+										<button type="button" id="fw-sm-repeat" class="button button-small" style="margin-left:.4em"
+										        data-profile="<?php echo esc_attr( wp_json_encode( [
+											'mode'    => (string) ( $last['mode'] ?? 'whole' ),
+											'target'  => (string) ( $last['target'] ?? '' ),
+											'stages'  => array_values( (array) ( $last['stages'] ?? [] ) ),
+											'folders' => (array) ( $last['folders'] ?? [] ),
+										] ) ); ?>">
+											<?php esc_html_e( 'Repeat that selection', 'fw' ); ?>
+										</button>
+									<?php endif; ?>
+								</p>
+							<?php endif; ?>
+							<div class="fw-sm-what" style="margin:.2em 0 1.2em">
+								<p style="font-weight:600;margin:0 0 .6em"><?php esc_html_e( 'What to send', 'fw' ); ?></p>
+
+								<div class="fw-sm-modes" style="display:flex;gap:.6em;flex-wrap:wrap;margin:0 0 1em;max-width:46em">
+									<label class="fw-sm-mode" style="flex:1 1 18em;border:1px solid #dcdcde;border-radius:4px;padding:.7em .9em;cursor:pointer;background:#fff">
+										<span style="display:flex;align-items:center;gap:.5em;font-weight:600">
+											<input type="radio" name="fw_sm_mode" value="whole" checked>
+											<?php esc_html_e( 'Whole site', 'fw' ); ?>
+										</span>
+										<span class="description" style="display:block;margin:.25em 0 0 1.7em">
+											<?php esc_html_e( 'Everything — database, uploads, themes, plugins and the rest.', 'fw' ); ?>
+										</span>
+									</label>
+									<label class="fw-sm-mode" style="flex:1 1 18em;border:1px solid #dcdcde;border-radius:4px;padding:.7em .9em;cursor:pointer;background:#fff">
+										<span style="display:flex;align-items:center;gap:.5em;font-weight:600">
+											<input type="radio" name="fw_sm_mode" value="choose">
+											<?php esc_html_e( 'Choose what to send', 'fw' ); ?>
+										</span>
+										<span class="description" style="display:block;margin:.25em 0 0 1.7em">
+											<?php esc_html_e( 'Pick stages and folders. Only files the destination does not already have are sent.', 'fw' ); ?>
+										</span>
+									</label>
+								</div>
+
+								<div id="fw-sm-cards" style="display:none;max-width:46em">
+									<?php
+									foreach ( $file_stages as $stage ) :
+										$is_db      = ( FW_SM_Stage::DATABASE === $stage );
+										$default_on = ! $is_db; // Database off by default in choose mode.
+										$entries    = FW_SM_Stage::is_file_stage( $stage )
+											? FW_SM_Stage::top_level( $stage, (int) ( $is_network ? get_current_blog_id() : 0 ) )
+											: [];
+										$has_folders = ( count( $entries ) > 1 );
 										?>
-									</p>
-
-									<div id="fw-sm-quick-opts" style="display:none;border-top:1px solid #f0f0f1;padding-top:.8em">
-										<p style="margin:.2em 0 .6em;font-weight:600">
-											<?php esc_html_e( 'Include', 'fw' ); ?>
-										</p>
-
-										<?php foreach ( FW_SM_Stage::all() as $stage ) : ?>
-											<?php if ( FW_SM_Stage::FINALIZE === $stage ) { continue; } ?>
-											<p style="margin:.25em 0">
-												<label>
-													<input type="checkbox" name="stages[]"
+										<div class="fw-sm-card" data-stage="<?php echo esc_attr( $stage ); ?>"
+										     style="border:1px solid #dcdcde;border-radius:4px;margin:0 0 .5em;background:#fff">
+											<div style="display:flex;align-items:center;gap:.6em;padding:.6em .9em">
+												<label style="font-weight:600;display:flex;align-items:center;gap:.5em;margin:0">
+													<input type="checkbox" class="fw-sm-inc" name="stages[]"
 													       value="<?php echo esc_attr( $stage ); ?>"
-													       <?php checked( FW_SM_Stage::DATABASE !== $stage ); ?>>
+													       <?php checked( $default_on ); ?>>
 													<?php echo esc_html( FW_SM_Stage::label( $stage ) ); ?>
-													<?php if ( FW_SM_Stage::DATABASE === $stage ) : ?>
-														<span class="description">
-															&mdash; <?php esc_html_e( 'off by default; see the warning below', 'fw' ); ?>
+												</label>
+												<span class="fw-sm-summary description" style="margin-left:auto;text-align:right"></span>
+												<?php if ( $has_folders || $is_db ) : ?>
+													<button type="button" class="button-link fw-sm-toggle" aria-expanded="false"
+													        style="text-decoration:none;white-space:nowrap"><?php esc_html_e( 'edit ▾', 'fw' ); ?></button>
+												<?php endif; ?>
+											</div>
+
+											<?php if ( $is_db ) : ?>
+												<div class="fw-sm-body" style="display:none;padding:0 .9em .8em">
+													<p class="description" style="max-width:44em;margin:.2em 0 0">
+														<strong><?php esc_html_e( 'Sending the database replaces the destination’s.', 'fw' ); ?></strong>
+														<?php
+														esc_html_e(
+															'Anything the destination recorded since your last copy — orders, comments, form entries, new users — is replaced, not merged. For pushing design or code changes to a live site, leave the database off.',
+															'fw'
+														);
+														?>
+													</p>
+												</div>
+											<?php elseif ( $has_folders ) : ?>
+												<div class="fw-sm-body fw-sm-folders" style="display:none;padding:0 .9em .8em">
+													<p style="margin:.2em 0 .4em">
+														<a href="#" class="fw-sm-all"><?php esc_html_e( 'all', 'fw' ); ?></a>
+														&middot;
+														<a href="#" class="fw-sm-none"><?php esc_html_e( 'none', 'fw' ); ?></a>
+														<span class="description" style="margin-left:.6em">
+															<?php
+															printf(
+																/* translators: %d: number of folders. */
+																esc_html__( '%d items', 'fw' ),
+																count( $entries )
+															);
+															?>
 														</span>
-													<?php endif; ?>
-												</label>
-											</p>
-
-										<?php
-										// The folders inside this stage. Offered only where there
-										// is a choice to make: a stage with one entry, or none,
-										// gets no list, because a checkbox that can only mean
-										// "yes" is noise.
-										$entries = FW_SM_Stage::is_file_stage( $stage )
-										? FW_SM_Stage::top_level( $stage, (int) ( $is_network ? get_current_blog_id() : 0 ) )
-										: [];
-										?>
-										<?php if ( count( $entries ) > 1 ) : ?>
-										<div class="fw-sm-folders" data-stage="<?php echo esc_attr( $stage ); ?>"
-										     style="margin:.1em 0 .8em 1.9em;padding:.5em .8em;border:1px solid #e0e0e0;background:#fff;max-height:12em;overflow:auto">
-											<p style="margin:0 0 .4em">
-												<a href="#" class="fw-sm-all"><?php esc_html_e( 'all', 'fw' ); ?></a>
-												&middot;
-												<a href="#" class="fw-sm-none"><?php esc_html_e( 'none', 'fw' ); ?></a>
-												<span class="description" style="margin-left:.6em">
-													<?php
-													printf(
-														/* translators: %d: number of folders. */
-														esc_html__( '%d items', 'fw' ),
-														count( $entries )
-													);
-													?>
-												</span>
-											</p>
-
-											<?php foreach ( $entries as $entry ) : ?>
-												<label style="display:block;margin:.15em 0">
-													<input type="checkbox"
-													       name="folders[<?php echo esc_attr( $stage ); ?>][]"
-													       value="<?php echo esc_attr( $entry['name'] ); ?>" checked>
-													<?php echo esc_html( $entry['name'] ); ?>
-													<?php if ( ! $entry['dir'] ) : ?>
-														<span class="description">&mdash; <?php esc_html_e( 'file', 'fw' ); ?></span>
-													<?php endif; ?>
-												</label>
-											<?php endforeach; ?>
+													</p>
+													<div style="max-height:12em;overflow:auto;border:1px solid #f0f0f1;padding:.4em .7em;border-radius:3px">
+														<?php foreach ( $entries as $entry ) : ?>
+															<label style="display:block;margin:.15em 0">
+																<input type="checkbox"
+																       name="folders[<?php echo esc_attr( $stage ); ?>][]"
+																       value="<?php echo esc_attr( $entry['name'] ); ?>" checked>
+																<?php echo esc_html( $entry['name'] ); ?>
+																<?php if ( ! $entry['dir'] ) : ?>
+																	<span class="description">&mdash; <?php esc_html_e( 'file', 'fw' ); ?></span>
+																<?php endif; ?>
+															</label>
+														<?php endforeach; ?>
+													</div>
+												</div>
+											<?php endif; ?>
 										</div>
-										<?php endif; ?>
-
-										<?php endforeach; ?>
-
-										<div class="notice notice-warning inline" style="margin:.8em 0 0">
-											<p style="max-width:46em">
-												<strong><?php esc_html_e( 'About including the database.', 'fw' ); ?></strong>
-												<?php
-												esc_html_e(
-													'A database push replaces the destination’s tables with this site’s. Anything the destination recorded since your last copy — orders, comments, form entries, new users — is replaced, not merged. For pushing design or code changes to a live site, leave the database unchecked.',
-													'fw'
-												);
-												?>
-											</p>
-										</div>
-									</div>
+									<?php endforeach; ?>
 								</div>
 							</div>
 
@@ -770,36 +824,126 @@ $tab_url = static function ( $which ) {
 
 							<script>
 							( function () {
-								// all / none, per stage.
+								var quick = document.getElementById( 'fw-sm-quick' );
+								var cards = document.getElementById( 'fw-sm-cards' );
+								var warn  = document.getElementById( 'fw-sm-full-warning' );
+								if ( ! quick || ! cards ) { return; }
+
+								// A card's one-line summary, kept in step with its
+								// own checkboxes — this is the whole point of the
+								// redesign: what each stage will do, at a glance.
+								function refresh( card ) {
+									var inc     = card.querySelector( '.fw-sm-inc' );
+									var summary = card.querySelector( '.fw-sm-summary' );
+									if ( ! summary ) { return; }
+
+									if ( inc && ! inc.checked ) {
+										summary.textContent = '<?php echo esc_js( __( 'not sent', 'fw' ) ); ?>';
+										summary.style.color = '#a7aaad';
+										return;
+									}
+
+									summary.style.color = '';
+									var boxes = card.querySelectorAll( '.fw-sm-folders input[type=checkbox]' );
+
+									if ( ! boxes.length ) {
+										summary.textContent = '<?php echo esc_js( __( 'everything', 'fw' ) ); ?>';
+										return;
+									}
+
+									var on = 0;
+									Array.prototype.forEach.call( boxes, function ( b ) { if ( b.checked ) { on++; } } );
+
+									summary.textContent = ( on === boxes.length )
+										? '<?php echo esc_js( __( 'everything', 'fw' ) ); ?>'
+										: on + ' / ' + boxes.length + ' <?php echo esc_js( __( 'folders', 'fw' ) ); ?>';
+								}
+
+								Array.prototype.forEach.call( cards.querySelectorAll( '.fw-sm-card' ), function ( card ) {
+									var body   = card.querySelector( '.fw-sm-body' );
+									var toggle = card.querySelector( '.fw-sm-toggle' );
+									var all    = card.querySelector( '.fw-sm-all' );
+									var none   = card.querySelector( '.fw-sm-none' );
+
+									if ( toggle && body ) {
+										toggle.addEventListener( 'click', function () {
+											var open = body.style.display !== 'none';
+											body.style.display = open ? 'none' : '';
+											toggle.setAttribute( 'aria-expanded', open ? 'false' : 'true' );
+											toggle.textContent = open
+												? '<?php echo esc_js( __( 'edit ▾', 'fw' ) ); ?>'
+												: '<?php echo esc_js( __( 'done ▴', 'fw' ) ); ?>';
+										} );
+									}
+
+									function setAll( on ) {
+										Array.prototype.forEach.call(
+											card.querySelectorAll( '.fw-sm-folders input[type=checkbox]' ),
+											function ( b ) { b.checked = on; }
+										);
+										refresh( card );
+									}
+									if ( all )  { all.addEventListener( 'click', function ( e ) { e.preventDefault(); setAll( true ); } ); }
+									if ( none ) { none.addEventListener( 'click', function ( e ) { e.preventDefault(); setAll( false ); } ); }
+
+									card.addEventListener( 'change', function () { refresh( card ); } );
+									refresh( card );
+								} );
+
+								// Mode: "whole" is the full migration (quick empty);
+								// "choose" reveals the cards and sets quick=1.
 								Array.prototype.forEach.call(
-									document.querySelectorAll( '.fw-sm-folders' ),
-									function ( panel ) {
-										function setAll( on ) {
-											Array.prototype.forEach.call(
-												panel.querySelectorAll( 'input[type=checkbox]' ),
-												function ( cb ) { cb.checked = on; }
-											);
-										}
-
-										var all  = panel.querySelector( '.fw-sm-all' );
-										var none = panel.querySelector( '.fw-sm-none' );
-
-										if ( all ) {
-											all.addEventListener( 'click', function ( e ) { e.preventDefault(); setAll( true ); } );
-										}
-
-										if ( none ) {
-											none.addEventListener( 'click', function ( e ) { e.preventDefault(); setAll( false ); } );
-										}
+									document.querySelectorAll( 'input[name=fw_sm_mode]' ),
+									function ( r ) {
+										r.addEventListener( 'change', function () {
+											var choose = ( document.querySelector( 'input[name=fw_sm_mode]:checked' ) || {} ).value === 'choose';
+											cards.style.display = choose ? '' : 'none';
+											quick.value = choose ? '1' : '';
+											if ( warn ) { warn.style.display = choose ? 'none' : ''; }
+										} );
 									}
 								);
 
-								var box  = document.getElementById( 'fw-sm-quick' );
-								var opts = document.getElementById( 'fw-sm-quick-opts' );
-								if ( ! box || ! opts ) { return; }
-								function sync() { opts.style.display = box.checked ? '' : 'none'; }
-								box.addEventListener( 'change', sync );
-								sync();
+								// Repeat the last selection: apply a saved profile to the
+								// form, then leave the user to press Migrate.
+								var repeat = document.getElementById( 'fw-sm-repeat' );
+								if ( repeat ) {
+									repeat.addEventListener( 'click', function () {
+										var prof;
+										try { prof = JSON.parse( repeat.getAttribute( 'data-profile' ) || '{}' ); }
+										catch ( e ) { return; }
+
+										var target = document.getElementById( 'fw-sm-target' );
+										if ( target && prof.target ) { target.value = prof.target; }
+
+										var wants = ( prof.mode === 'choose' );
+										var radio = document.querySelector( 'input[name=fw_sm_mode][value=' + ( wants ? 'choose' : 'whole' ) + ']' );
+										if ( radio ) { radio.checked = true; radio.dispatchEvent( new Event( 'change', { bubbles: true } ) ); }
+
+										if ( ! wants ) { return; }
+
+										var stages = prof.stages || [];
+										var folders = prof.folders || {};
+
+										Array.prototype.forEach.call( cards.querySelectorAll( '.fw-sm-card' ), function ( card ) {
+											var stage = card.getAttribute( 'data-stage' );
+											var inc   = card.querySelector( '.fw-sm-inc' );
+											if ( inc ) { inc.checked = ( stages.indexOf( stage ) !== -1 ); }
+
+											// A saved folder list narrows this stage; its absence
+											// means the whole stage, so leave every box checked.
+											var keep = folders[ stage ];
+											if ( keep && keep.length !== undefined ) {
+												Array.prototype.forEach.call(
+													card.querySelectorAll( '.fw-sm-folders input[type=checkbox]' ),
+													function ( b ) { b.checked = ( keep.indexOf( b.value ) !== -1 ); }
+												);
+											}
+
+											refresh( card );
+										} );
+									} );
+								}
 							}() );
 							</script>
 

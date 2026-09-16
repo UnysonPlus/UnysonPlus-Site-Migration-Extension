@@ -510,6 +510,7 @@ class FW_SM_Receiver {
 		$part = $target . '.fwsm-part';
 
 		if ( ! wp_mkdir_p( dirname( $target ) ) ) {
+			$this->note_skip( $session );
 			$this->respond( [ 'written' => false, 'skipped' => true ] );
 		}
 
@@ -526,6 +527,7 @@ class FW_SM_Receiver {
 		if ( ! $handle ) {
 			// One unwritable file must not end a migration — read-only plugin
 			// directories are ordinary on managed hosts. Report and move on.
+			$this->note_skip( $session );
 			$this->respond( [ 'written' => false, 'skipped' => true ] );
 		}
 
@@ -559,6 +561,7 @@ class FW_SM_Receiver {
 		if ( false === $written ) {
 			@unlink( $part ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
 
+			$this->note_skip( $session );
 			$this->respond( [ 'written' => false, 'skipped' => true ] );
 		}
 
@@ -614,6 +617,7 @@ class FW_SM_Receiver {
 		if ( ! @rename( $part, $landing ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
 			@unlink( $part ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
 
+			$this->note_skip( $session );
 			$this->respond( [ 'written' => false, 'skipped' => true ] );
 		}
 
@@ -1199,6 +1203,23 @@ class FW_SM_Receiver {
 	}
 
 	/**
+	 * Note that the destination could not place a file it was sent.
+	 *
+	 * Any skip disables the finalize prune: what was not fully received cannot
+	 * be judged complete, so orphans must not be deleted against it. The bundle
+	 * path records this the same way (see handle_bundle); this keeps a chunked
+	 * skip — a single large file the destination refused — just as safe.
+	 *
+	 * @param array $session
+	 *
+	 * @return void
+	 */
+	private function note_skip( $session ) {
+		$session['skipped_files'] = (int) ( $session['skipped_files'] ?? 0 ) + 1;
+		update_option( self::SESSION_OPTION, $session, false );
+	}
+
+	/**
 	 * Where this migration's list of pending replacements lives.
 	 *
 	 * @param array $session
@@ -1335,6 +1356,7 @@ class FW_SM_Receiver {
 			$target = substr( $staged, 0, -strlen( self::STAGED_SUFFIX ) );
 
 			if ( @rename( $staged, $target ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+				$this->invalidate_opcode( $target );
 				$swapped++;
 				continue;
 			}
@@ -1350,6 +1372,37 @@ class FW_SM_Receiver {
 		@unlink( $path ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
 
 		return [ 'swapped' => $swapped, 'failed' => $failed ];
+	}
+
+	/**
+	 * Drop a just-replaced PHP file from the opcode cache.
+	 *
+	 * A swap changes a file's CONTENTS in place — same path, new code. PHP does
+	 * not re-read a file it has already compiled unless the opcode cache is told
+	 * to, and a managed host commonly runs OPcache with timestamp validation
+	 * OFF for speed, so the destination keeps EXECUTING the file it started with
+	 * even though the new bytes are on disk. That is why a migrated template or
+	 * shortcode can look unchanged no matter how many times the WordPress page
+	 * and object caches are cleared: those never touch OPcache. Invalidating the
+	 * file here makes the swap actually take effect on the next request.
+	 *
+	 * Only PHP files carry bytecode, and force is required precisely because the
+	 * timestamp may not have moved. Where a host disables the function it simply
+	 * no-ops — the site owner then clears the opcode cache from the host's own
+	 * tools once, which every managed host exposes.
+	 *
+	 * @param string $target Absolute path just swapped into place.
+	 *
+	 * @return void
+	 */
+	private function invalidate_opcode( $target ) {
+		if ( '.php' !== strtolower( (string) substr( $target, -4 ) ) ) {
+			return;
+		}
+
+		if ( function_exists( 'opcache_invalidate' ) ) {
+			@opcache_invalidate( $target, true ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+		}
 	}
 
 	/**
