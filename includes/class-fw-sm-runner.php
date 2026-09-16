@@ -737,13 +737,17 @@ class FW_SM_Runner {
 			);
 		}
 
-		if ( ! empty( $result['swap_failed'] ) ) {
+		// The true count, not the length of the capped example list — a host that
+		// refuses thousands of overwrites must say thousands, not "20".
+		$swap_failed_count = (int) ( $result['swap_failed_count'] ?? count( (array) ( $result['swap_failed'] ?? [] ) ) );
+
+		if ( $swap_failed_count > 0 ) {
 			FW_SM_State::log(
 				sprintf(
 					/* translators: 1: count, 2: example paths. */
 					__( 'Warning: %1$d file(s) could not be put in place and the destination is still running its old copy of them. For example: %2$s', 'fw' ),
-					count( (array) $result['swap_failed'] ),
-					implode( ', ', array_slice( (array) $result['swap_failed'], 0, 3 ) )
+					$swap_failed_count,
+					implode( ', ', array_slice( (array) ( $result['swap_failed'] ?? [] ), 0, 3 ) )
 				)
 			);
 		}

@@ -121,6 +121,30 @@ $ex    = [];
 $after = $sw->sweep( $root, false, $ex ); // a swept tree is clean
 check( 'nothing remains after the sweep', $after, 0 );
 
+echo "\n-- the swap falls back to copy-in-place when a rename is refused --\n";
+// Mirrors swap_staged_files: try rename, then overwrite the bytes in place. On
+// a host that allows writing a file's contents but not a directory rename, the
+// fallback is the only way a replacement goes live at all.
+function swap_one( $staged, $target, $rename_allowed ) {
+	if ( $rename_allowed && @rename( $staged, $target ) ) { return 'renamed'; }
+	if ( @copy( $staged, $target ) ) { @unlink( $staged ); return 'copied'; }
+	return 'failed';
+}
+
+rrm( $root );
+put( "$root/themes/child/view.php", 'OLD template' );
+put( "$root/themes/child/view.php.fwsm-new", 'NEW template' );
+
+check( 'when rename works, it is used', swap_one( "$root/themes/child/view.php.fwsm-new", "$root/themes/child/view.php", true ), 'renamed' );
+check( 'the new template is live', file_get_contents( "$root/themes/child/view.php" ), 'NEW template' );
+
+// Now the host refuses the rename; the file itself is still writable.
+put( "$root/themes/child/view.php", 'OLD again' );
+put( "$root/themes/child/view.php.fwsm-new", 'NEW via copy' );
+check( 'when rename is refused, copy-in-place takes over', swap_one( "$root/themes/child/view.php.fwsm-new", "$root/themes/child/view.php", false ), 'copied' );
+check( 'the change still goes live', file_get_contents( "$root/themes/child/view.php" ), 'NEW via copy' );
+check( 'and the staged copy is cleaned up', file_exists( "$root/themes/child/view.php.fwsm-new" ), false );
+
 rrm( $root );
 
 echo "\n========================================\n";

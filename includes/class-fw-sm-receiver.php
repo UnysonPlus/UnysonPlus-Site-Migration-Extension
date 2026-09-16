@@ -713,11 +713,12 @@ class FW_SM_Receiver {
 				[ 'swapped' => 0, 'files' => (int) $session['files'] ]
 				+ $pruned
 				+ [
-					'verify'        => $this->verify_landed(),
-					'files_swapped' => $swap['swapped'],
-					'swap_failed'   => $swap['failed'],
-					'staged_left'   => $fo_left,
-					'left_example'  => $fo_examples,
+					'verify'            => $this->verify_landed(),
+					'files_swapped'     => $swap['swapped'],
+					'swap_failed'       => $swap['failed'],
+					'swap_failed_count' => (int) ( $swap['failed_count'] ?? 0 ),
+					'staged_left'       => $fo_left,
+					'left_example'      => $fo_examples,
 				]
 			);
 		}
@@ -790,11 +791,12 @@ class FW_SM_Receiver {
 				'swapped' => count( $session['tables'] ),
 				'files'   => (int) $session['files'],
 			] + $pruned + [
-				'verify'         => $this->verify_landed(),
-				'files_swapped'  => $swap['swapped'],
-				'swap_failed'    => $swap['failed'],
-				'staged_left'    => $left_over,
-				'left_example'   => $left_examples,
+				'verify'            => $this->verify_landed(),
+				'files_swapped'     => $swap['swapped'],
+				'swap_failed'       => $swap['failed'],
+				'swap_failed_count' => (int) ( $swap['failed_count'] ?? 0 ),
+				'staged_left'       => $left_over,
+				'left_example'      => $left_examples,
 			]
 		);
 	}
@@ -1360,23 +1362,24 @@ class FW_SM_Receiver {
 	 *
 	 * @param array $session
 	 *
-	 * @return array [ 'swapped' => int, 'failed' => string[] ]
+	 * @return array [ 'swapped' => int, 'failed' => string[], 'failed_count' => int ]
 	 */
 	private function swap_staged_files( $session ) {
 		$path = self::staged_list_path( $session );
 
 		if ( null === $path || ! is_file( $path ) ) {
-			return [ 'swapped' => 0, 'failed' => [] ];
+			return [ 'swapped' => 0, 'failed' => [], 'failed_count' => 0 ];
 		}
 
 		$handle = @fopen( $path, 'rb' ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
 
 		if ( ! $handle ) {
-			return [ 'swapped' => 0, 'failed' => [] ];
+			return [ 'swapped' => 0, 'failed' => [], 'failed_count' => 0 ];
 		}
 
-		$swapped = 0;
-		$failed  = [];
+		$swapped      = 0;
+		$failed       = [];
+		$failed_count = 0;
 
 		while ( false !== ( $line = fgets( $handle ) ) ) { // phpcs:ignore WordPress.WP.AlternativeFunctions
 			$staged = trim( $line );
@@ -1387,14 +1390,40 @@ class FW_SM_Receiver {
 
 			$target = substr( $staged, 0, -strlen( self::STAGED_SUFFIX ) );
 
+			// A rename is atomic and cheap, so it is the first choice. But some
+			// managed hosts serve deployed code from a layer where the file's
+			// CONTENTS are writable yet the directory will not accept a new
+			// entry — so creating the .fwsm-new beside it succeeds while renaming
+			// over the live file fails. On those hosts a rename-only swap leaves
+			// thousands of replacements stranded (the exact symptom: a migrated
+			// theme whose changes never appear). So when the rename is refused,
+			// fall back to overwriting the live file's bytes in place, which asks
+			// only for write on the file, not the directory.
 			if ( @rename( $staged, $target ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
 				$this->invalidate_opcode( $target );
 				$swapped++;
 				continue;
 			}
 
-			// Left in place rather than deleted: the old file is still correct,
-			// and the .fwsm-new beside it is evidence for anyone looking.
+			// The copy is not atomic the way the rename is, but the staged file
+			// was fully written and checksum-verified before finalize, so the
+			// bytes are known-good; the only cost is a millisecond window where a
+			// concurrent request could read a partly-written file. That is a far
+			// better outcome than the change never going live at all, and it only
+			// applies to files the rename could not place.
+			if ( @copy( $staged, $target ) ) { // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
+				@unlink( $staged ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
+				$this->invalidate_opcode( $target );
+				$swapped++;
+				continue;
+			}
+
+			// Genuinely could not be put in place by either route. Left as it is
+			// — the old file is still correct, and the .fwsm-new beside it is
+			// evidence. The full count is kept even though only a few are named,
+			// so the log states the true scale rather than the example cap.
+			$failed_count++;
+
 			if ( count( $failed ) < 20 ) {
 				$failed[] = $target;
 			}
@@ -1403,7 +1432,7 @@ class FW_SM_Receiver {
 		fclose( $handle ); // phpcs:ignore WordPress.WP.AlternativeFunctions
 		@unlink( $path ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
 
-		return [ 'swapped' => $swapped, 'failed' => $failed ];
+		return [ 'swapped' => $swapped, 'failed' => $failed, 'failed_count' => $failed_count ];
 	}
 
 	/**
