@@ -220,6 +220,26 @@ class FW_SM_Runner {
 			)
 		);
 
+		// The destination sweeps staged files left by an earlier attempt before
+		// it starts. Reported here so a littered destination is visible and
+		// explained, rather than silently cleaned.
+		$swept = (int) ( $opened['staged_swept'] ?? 0 );
+
+		if ( $swept > 0 ) {
+			FW_SM_State::log(
+				sprintf(
+					/* translators: %d: number of files. */
+					_n(
+						'Cleared %d leftover staged file from a previous migration before starting.',
+						'Cleared %d leftover staged files from a previous migration before starting.',
+						$swept,
+						'fw'
+					),
+					$swept
+				)
+			);
+		}
+
 		$this->dispatch();
 
 		return $state;
@@ -725,6 +745,27 @@ class FW_SM_Runner {
 					count( (array) $result['swap_failed'] ),
 					implode( ', ', array_slice( (array) $result['swap_failed'], 0, 3 ) )
 				)
+			);
+		}
+
+		// The "after" half of the staged-file check: with everything swapped,
+		// the destination should hold no .fwsm-new at all. Reported either way
+		// — a clean zero is the reassurance that the migration truly landed,
+		// and a non-zero is the one signal that a change quietly did not.
+		$staged_left = (int) ( $result['staged_left'] ?? 0 );
+
+		if ( $staged_left > 0 ) {
+			FW_SM_State::log(
+				sprintf(
+					/* translators: 1: count, 2: example paths. */
+					__( 'Warning: %1$d staged file(s) (.fwsm-new) still remain on the destination and are NOT live — your changes to them did not apply. Migrate again; if they persist, the destination is refusing to overwrite those paths. For example: %2$s', 'fw' ),
+					$staged_left,
+					implode( ', ', array_slice( (array) ( $result['left_example'] ?? [] ), 0, 3 ) )
+				)
+			);
+		} elseif ( isset( $result['staged_left'] ) ) {
+			FW_SM_State::log(
+				__( 'Checked the destination: no leftover staged files — every replacement is live.', 'fw' )
 			);
 		}
 

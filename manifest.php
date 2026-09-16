@@ -11,7 +11,7 @@ $manifest['description'] = __(
 	'fw'
 );
 
-$manifest['version']    = '1.0.25';
+$manifest['version']    = '1.0.26';
 $manifest['display']    = true;
 $manifest['standalone'] = true;
 $manifest['thumbnail']  = 'thumbnail.svg';
@@ -34,6 +34,19 @@ $manifest['requires_wp']  = '5.8';
 /**
  * Changelog
  * -----------------------------------------------------------------------------
+ * 1.0.26 - Automatic leftover-staged-file detection, before and after every
+ *          migration. A replacement is written beside its live file as a
+ *          .fwsm-new and only renamed into place at finalize; a run that is
+ *          cancelled or fails before finalize leaves those behind, and since
+ *          swap_staged_files only promotes the current run's list, they were
+ *          never cleaned up — so they accumulated across attempts and silently
+ *          hid that a file's update never went live (WordPress keeps running
+ *          the .php beside the .fwsm-new). The destination now sweeps the whole
+ *          content tree for orphaned .fwsm-new/.fwsm-part at the START of every
+ *          migration, so each begins from a clean slate, and re-scans at the
+ *          END, reporting in the log whether any replacement was left
+ *          un-promoted. Both are automatic; there is nothing to click.
+ *
  * 1.0.13 - Quick migration, a connection test, and a side-by-side comparison
  *          with the destination.
  *

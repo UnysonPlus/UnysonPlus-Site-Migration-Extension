@@ -84,6 +84,43 @@ $suffix = '.fwsm-new';
 check( 'a .fwsm-new file is recognised', $suffix === substr( 'bootstrap.php.fwsm-new', -strlen( $suffix ) ), true );
 check( 'an ordinary file is not', $suffix === substr( 'bootstrap.php', -strlen( $suffix ) ), false );
 
+echo "\n-- the automatic sweep finds every leftover staged file, anywhere --\n";
+// The real recursive walker, lifted from the receiver.
+$s2  = strpos( $src, 'private function scan_staged_dir( $dir, $delete, array &$examples, $depth ) {' );
+$e2  = strpos( $src, "\n\t}", $s2 ) + 4;
+eval( 'class Sweeper { const STAGED_SUFFIX = ".fwsm-new"; public function sweep( $dir, $delete, array &$ex ) { return $this->scan_staged_dir( $dir, $delete, $ex, 0 ); } ' . str_replace( 'private function scan_staged_dir', 'public function scan_staged_dir', substr( $src, $s2, $e2 - $s2 ) ) . ' }' );
+
+rrm( $root );
+// A tree with live files plus leftovers scattered at several depths.
+put( "$root/themes/child/view.php", 'live' );
+put( "$root/themes/child/view.php.fwsm-new", 'staged replacement' );
+put( "$root/themes/child/nested/deep/tpl.php.fwsm-new", 'staged, deep' );
+put( "$root/plugins/acme/main.php", 'live' );
+put( "$root/plugins/acme/main.php.fwsm-part", 'half-transferred' );
+put( "$root/uploads/2026/image.jpg", 'a normal upload, must survive' );
+
+$sw = new Sweeper();
+
+$ex    = [];
+$found = $sw->sweep( $root, false, $ex ); // count-only (the "after" check)
+check( 'count mode finds all three leftovers', $found, 3 );
+check( 'count mode deletes nothing', file_exists( "$root/themes/child/view.php.fwsm-new" ), true );
+check( 'count mode collects examples', count( $ex ) > 0, true );
+
+$ex   = [];
+$gone = $sw->sweep( $root, true, $ex ); // clean (the "before" sweep)
+check( 'clean mode removes all three', $gone, 3 );
+check( 'the .fwsm-new next to a live file is gone', file_exists( "$root/themes/child/view.php.fwsm-new" ), false );
+check( 'the deep .fwsm-new is gone', file_exists( "$root/themes/child/nested/deep/tpl.php.fwsm-new" ), false );
+check( 'the .fwsm-part is gone', file_exists( "$root/plugins/acme/main.php.fwsm-part" ), false );
+check( 'every LIVE file survives the sweep', file_get_contents( "$root/themes/child/view.php" ), 'live' );
+check( 'the plugin live file survives', file_get_contents( "$root/plugins/acme/main.php" ), 'live' );
+check( 'the upload survives', file_get_contents( "$root/uploads/2026/image.jpg" ), 'a normal upload, must survive' );
+
+$ex    = [];
+$after = $sw->sweep( $root, false, $ex ); // a swept tree is clean
+check( 'nothing remains after the sweep', $after, 0 );
+
 rrm( $root );
 
 echo "\n========================================\n";

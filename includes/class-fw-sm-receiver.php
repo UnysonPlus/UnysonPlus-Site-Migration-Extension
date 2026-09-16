@@ -313,6 +313,18 @@ class FW_SM_Receiver {
 		// Whatever a previous attempt left behind is not ours and not wanted.
 		FW_SM_Importer::drop_staging_tables();
 
+		// The same is true of staged FILES. A .fwsm-new sitting beside a live
+		// file, or a .fwsm-part from a transfer that never finished, is debris
+		// from an earlier attempt — successful, cancelled or failed. A finished
+		// migration promotes every .fwsm-new and discards the rest, so any that
+		// survive are always leftovers, and left alone they accumulate across
+		// attempts and quietly mask that a file's update never went live (the
+		// live .php keeps running beside the new one). Sweep them so this
+		// migration starts from a clean tree; the count is reported so the
+		// source can say what it cleared.
+		$swept_examples = [];
+		$swept          = $this->sweep_staged_files( true, $swept_examples );
+
 		$mode      = sanitize_key( $payload['mode'] ?? FW_SM_Multisite::MODE_SINGLE );
 		$dest_blog = 0;
 		$dest_url  = untrailingslashit( home_url() );
@@ -376,9 +388,11 @@ class FW_SM_Receiver {
 
 		$this->respond(
 			[
-				'ready'        => true,
-				'dest_blog_id' => $dest_blog,
-				'dest_url'     => $dest_url,
+				'ready'         => true,
+				'dest_blog_id'  => $dest_blog,
+				'dest_url'      => $dest_url,
+				'staged_swept'  => $swept,
+				'swept_example' => $swept_examples,
 			]
 		);
 	}
@@ -692,10 +706,19 @@ class FW_SM_Receiver {
 			// Files-only migrations are legitimate; there is simply no swap.
 			$this->finish_session();
 
+			$fo_examples = [];
+			$fo_left     = $this->sweep_staged_files( false, $fo_examples );
+
 			$this->respond(
 				[ 'swapped' => 0, 'files' => (int) $session['files'] ]
 				+ $pruned
-				+ [ 'verify' => $this->verify_landed(), 'files_swapped' => $swap['swapped'], 'swap_failed' => $swap['failed'] ]
+				+ [
+					'verify'        => $this->verify_landed(),
+					'files_swapped' => $swap['swapped'],
+					'swap_failed'   => $swap['failed'],
+					'staged_left'   => $fo_left,
+					'left_example'  => $fo_examples,
+				]
 			);
 		}
 
@@ -755,14 +778,23 @@ class FW_SM_Receiver {
 
 		$this->finish_session();
 
+		// The "after" check: with the swap done, nothing should still be staged.
+		// Anything left is a replacement that could not be put in place, so its
+		// update is NOT live — count it (do not delete it; it is the new copy,
+		// and the source reports it so the user knows a retry is needed).
+		$left_examples = [];
+		$left_over     = $this->sweep_staged_files( false, $left_examples );
+
 		$this->respond(
 			[
 				'swapped' => count( $session['tables'] ),
 				'files'   => (int) $session['files'],
 			] + $pruned + [
-				'verify'        => $this->verify_landed(),
-				'files_swapped' => $swap['swapped'],
-				'swap_failed'   => $swap['failed'],
+				'verify'         => $this->verify_landed(),
+				'files_swapped'  => $swap['swapped'],
+				'swap_failed'    => $swap['failed'],
+				'staged_left'    => $left_over,
+				'left_example'   => $left_examples,
 			]
 		);
 	}
@@ -1372,6 +1404,91 @@ class FW_SM_Receiver {
 		@unlink( $path ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
 
 		return [ 'swapped' => $swapped, 'failed' => $failed ];
+	}
+
+	/**
+	 * Find — and optionally remove — staged files left under wp-content.
+	 *
+	 * A .fwsm-new (a replacement waiting to go live) or .fwsm-part (a transfer
+	 * still in flight) should never outlive the migration that created it: a
+	 * successful finalize promotes every .fwsm-new and a failed one discards
+	 * them. One found on disk afterwards is therefore always debris — from a run
+	 * that was cancelled, that failed before finalize, or whose swap could not
+	 * overwrite a live file. This walks the whole content tree because a staged
+	 * file can sit anywhere a file was replaced, not only in the code stages.
+	 *
+	 * Called two ways: to CLEAN (delete) at the start of a migration, so it
+	 * begins from a clean tree; and to COUNT (no delete) at the end, so the
+	 * source can warn if anything was left un-promoted.
+	 *
+	 * @param bool     $delete   Remove each one (begin) or only count it (finalize).
+	 * @param string[] $examples Collects a handful of absolute paths, by reference.
+	 *
+	 * @return int How many were found (and, when $delete, removed).
+	 */
+	private function sweep_staged_files( $delete, array &$examples ) {
+		$root = wp_normalize_path( WP_CONTENT_DIR );
+
+		if ( ! is_dir( $root ) ) {
+			return 0;
+		}
+
+		return $this->scan_staged_dir( $root, $delete, $examples, 0 );
+	}
+
+	/**
+	 * Recursive worker for sweep_staged_files().
+	 *
+	 * @param string   $dir      Absolute directory to walk.
+	 * @param bool     $delete   Remove matches, or only count them.
+	 * @param string[] $examples Collects a handful of absolute paths, by reference.
+	 * @param int      $depth    Recursion guard against a pathological tree.
+	 *
+	 * @return int
+	 */
+	private function scan_staged_dir( $dir, $delete, array &$examples, $depth ) {
+		if ( $depth > 40 ) {
+			return 0;
+		}
+
+		$entries = @scandir( $dir ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+
+		if ( false === $entries ) {
+			return 0;
+		}
+
+		$count = 0;
+
+		foreach ( $entries as $entry ) {
+			if ( '.' === $entry || '..' === $entry ) {
+				continue;
+			}
+
+			$absolute = $dir . '/' . $entry;
+
+			if ( is_dir( $absolute ) && ! is_link( $absolute ) ) {
+				$count += $this->scan_staged_dir( $absolute, $delete, $examples, $depth + 1 );
+				continue;
+			}
+
+			if ( '.fwsm-part' !== substr( $entry, -10 )
+				&& self::STAGED_SUFFIX !== substr( $entry, -strlen( self::STAGED_SUFFIX ) ) ) {
+				continue;
+			}
+
+			// Counting mode records every one; cleaning mode counts it only if
+			// the delete actually succeeds, so the reported figure is what truly
+			// went away rather than what was merely attempted.
+			if ( ! $delete || @unlink( $absolute ) ) { // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
+				if ( count( $examples ) < 5 ) {
+					$examples[] = $absolute;
+				}
+
+				$count++;
+			}
+		}
+
+		return $count;
 	}
 
 	/**
