@@ -11,7 +11,7 @@ $manifest['description'] = __(
 	'fw'
 );
 
-$manifest['version']    = '1.0.29';
+$manifest['version']    = '1.0.30';
 $manifest['display']    = true;
 $manifest['standalone'] = true;
 $manifest['thumbnail']  = 'thumbnail.svg';
@@ -34,6 +34,16 @@ $manifest['requires_wp']  = '5.8';
 /**
  * Changelog
  * -----------------------------------------------------------------------------
+ * 1.0.30 - The log now names the failure a site owner actually feels. When the
+ *          files the destination refused to overwrite include THEME or PLUGIN
+ *          code, it says so directly — that this host locks theme and plugin
+ *          files against writes from the site itself, so the database and
+ *          uploads migrated but the code must be deployed with the host's own
+ *          SFTP or Git tools. Host-agnostic, and counted apart from the host's
+ *          own quarantined-plugin folders so the notice fires only when the
+ *          owner's code really did not update, turning a mystery ("my theme did
+ *          not change") into a one-line answer.
+ *
  * 1.0.29 - Finalize now cleans up after itself. When the destination cannot put
  *          a staged replacement in place (a managed host that refuses to
  *          overwrite certain existing files, so both the rename and the

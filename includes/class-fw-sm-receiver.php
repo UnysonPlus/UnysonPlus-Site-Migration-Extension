@@ -717,6 +717,7 @@ class FW_SM_Receiver {
 					'files_swapped'     => $swap['swapped'],
 					'swap_failed'       => $swap['failed'],
 					'swap_failed_count' => (int) ( $swap['failed_count'] ?? 0 ),
+					'swap_failed_code'  => (int) ( $swap['code_failed'] ?? 0 ),
 					'staged_left'       => $fo_left,
 					'left_example'      => $fo_examples,
 				]
@@ -795,6 +796,7 @@ class FW_SM_Receiver {
 				'files_swapped'     => $swap['swapped'],
 				'swap_failed'       => $swap['failed'],
 				'swap_failed_count' => (int) ( $swap['failed_count'] ?? 0 ),
+				'swap_failed_code'  => (int) ( $swap['code_failed'] ?? 0 ),
 				'staged_left'       => $left_over,
 				'left_example'      => $left_examples,
 			]
@@ -1380,6 +1382,7 @@ class FW_SM_Receiver {
 		$swapped      = 0;
 		$failed       = [];
 		$failed_count = 0;
+		$code_failed  = 0;
 
 		while ( false !== ( $line = fgets( $handle ) ) ) { // phpcs:ignore WordPress.WP.AlternativeFunctions
 			$staged = trim( $line );
@@ -1433,6 +1436,26 @@ class FW_SM_Receiver {
 			// kept, and the after-scan still reports it.
 			$failed_count++;
 
+			// A theme or plugin file that will not go live is the failure a site
+			// owner actually feels — their code did not update. Counted apart from
+			// the host's own protected junk (its cache and quarantined-plugin
+			// folders) so the source can tell them, specifically, that this host
+			// locks theme and plugin code and must be given it another way. A
+			// quarantine folder — a wp-content dir named like "_something-disabled"
+			// where a host parks its own neutralised plugins — is excluded, even
+			// though it can hold a "mu-plugins" subfolder, because it is not the
+			// owner's code and its writes are refused by design.
+			$normalized = wp_normalize_path( $target );
+
+			$is_code = ( false !== strpos( $normalized, '/themes/' )
+				|| false !== strpos( $normalized, '/plugins/' )
+				|| false !== strpos( $normalized, '/mu-plugins/' ) )
+				&& ! preg_match( '#/_[^/]*-disabled/#', $normalized );
+
+			if ( $is_code ) {
+				$code_failed++;
+			}
+
 			if ( is_file( $target ) ) {
 				@unlink( $staged ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
 			}
@@ -1445,7 +1468,12 @@ class FW_SM_Receiver {
 		fclose( $handle ); // phpcs:ignore WordPress.WP.AlternativeFunctions
 		@unlink( $path ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
 
-		return [ 'swapped' => $swapped, 'failed' => $failed, 'failed_count' => $failed_count ];
+		return [
+			'swapped'      => $swapped,
+			'failed'       => $failed,
+			'failed_count' => $failed_count,
+			'code_failed'  => $code_failed,
+		];
 	}
 
 	/**

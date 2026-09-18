@@ -172,6 +172,26 @@ check( 'so nothing that only exists as .fwsm-new is lost', file_exists( "$root/t
 
 rrm( $root );
 
+echo "\n-- a refused swap is flagged as CODE only for theme/plugin paths --\n";
+// Mirrors the classifier that decides whether to tell the owner their own code
+// did not update, versus the host's protected junk that never should.
+function is_code_failure( $target ) {
+	$n = str_replace( '\\', '/', $target );
+	return ( false !== strpos( $n, '/themes/' )
+		|| false !== strpos( $n, '/plugins/' )
+		|| false !== strpos( $n, '/mu-plugins/' ) )
+		&& ! preg_match( '#/_[^/]*-disabled/#', $n );
+}
+check( 'a theme file counts as code', is_code_failure( '/nas/live/wp-content/themes/child/author.php' ), true );
+check( 'a plugin file counts as code', is_code_failure( '/nas/live/wp-content/plugins/acme/main.php' ), true );
+check( 'an mu-plugin file counts as code', is_code_failure( '/nas/live/wp-content/mu-plugins/x.php' ), true );
+check( 'an uploads file does not', is_code_failure( '/nas/live/wp-content/uploads/wp-migrate-db/index.php' ), false );
+// The trap: a host quarantine folder can hold its own mu-plugins subtree, but
+// that is not the owner's code and must not trip the "your code did not update"
+// notice.
+check( 'a quarantined host plugin does not count', is_code_failure( '/nas/live/wp-content/_wpe-disabled/mu-plugins/force-strong-passwords/x.php' ), false );
+check( 'a quarantined loose file does not count', is_code_failure( '/nas/live/wp-content/_wpe-disabled/mu-plugin.php' ), false );
+
 echo "\n========================================\n";
 echo "  $pass passed, $fail failed\n";
 exit( $fail > 0 ? 1 : 0 );

@@ -752,6 +752,24 @@ class FW_SM_Runner {
 			);
 		}
 
+		// When those refusals include THEME or PLUGIN files, the site owner's own
+		// code did not update — the failure they actually feel. Some managed hosts
+		// deliberately lock theme and plugin files against writes from the site
+		// itself; code is meant to be deployed through the host's own tools. Say so
+		// plainly, host-agnostically, so the fix is obvious instead of a mystery:
+		// the database and uploads migrated, but code must be delivered another way.
+		$swap_failed_code = (int) ( $result['swap_failed_code'] ?? 0 );
+
+		if ( $swap_failed_code > 0 ) {
+			FW_SM_State::log(
+				sprintf(
+					/* translators: %d: number of theme/plugin files. */
+					__( 'Note: %d of those are theme or plugin files, so that code did not update on the destination. This host locks theme and plugin files against writes from the site itself — the database and uploads migrated fine, but code must be deployed with the host\'s own SFTP or Git tools instead.', 'fw' ),
+					$swap_failed_code
+				)
+			);
+		}
+
 		// The "after" half of the staged-file check: with everything swapped,
 		// the destination should hold no .fwsm-new at all. Reported either way
 		// — a clean zero is the reassurance that the migration truly landed,
