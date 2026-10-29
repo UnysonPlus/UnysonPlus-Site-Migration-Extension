@@ -138,6 +138,21 @@ class FW_SM_File_Scanner {
 						'*/db.php',
 						'*/db-error.php',
 						'*/wp-cache-config.php',
+						// Backup archives and WordPress's own upgrade scratch dir: all
+						// regenerable, host-local, and frequently hundreds of MB — a stale
+						// `ai1wm-backups`, `fw-backup` or `updraft` folder is NOT site content,
+						// and trying to push it over the wire is what stalls a migration (the
+						// connection resets on the giant transfer). A backup *plugin* still
+						// travels in the PLUGINS stage; this only drops its stored archives
+						// under wp-content. `is_excluded()` matches with fnmatch() WITHOUT
+						// FNM_PATHNAME, so `*` crosses '/' and `*backup*/*` catches
+						// `ai1wm-backups`, `fw-backup`, `backups` and `upgrade-temp-backup`
+						// alike — which the narrower `*/backup*/*` (segment must START with
+						// "backup") did not.
+						'*backup*/*',
+						'/updraft/*',
+						'/updraft-pro/*',
+						'/upgrade/*',
 					]
 				);
 				break;

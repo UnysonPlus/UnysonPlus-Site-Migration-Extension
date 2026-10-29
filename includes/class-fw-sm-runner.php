@@ -511,11 +511,21 @@ class FW_SM_Runner {
 
 		$excludes = FW_SM_File_Scanner::default_excludes( $stage );
 
-		// A subsite's own root is already .../uploads/sites/<id>, so the
-		// exclusion that keeps blog 1 out of sites/ would exclude everything.
-		// Paths are matched relative to the stage root, so the guard is simply
-		// not to apply it when the root is itself a subsite directory.
-		if ( FW_SM_Stage::UPLOADS === $stage && (int) ( $state['options']['source_blog_id'] ?? 0 ) > 1 ) {
+		// The */sites/* exclusion stops a SINGLE-site migration from dragging a
+		// whole network's media out of blog 1's uploads root. Two cases must lift
+		// it, or they lose every subsite's uploads:
+		//
+		//  - a subsite migration, whose own root is already .../uploads/sites/<id>,
+		//    so the pattern would exclude everything;
+		//  - a whole-NETWORK migration, meant to carry every subsite's media under
+		//    sites/<id>/. Blog 1 stays the source blog (id 1), so without this the
+		//    network arrives with every subsite's uploads missing — the site is
+		//    there, its images are not.
+		$uploads_mode    = $state['options']['mode'] ?? FW_SM_Multisite::MODE_SINGLE;
+		$carry_all_sites = (int) ( $state['options']['source_blog_id'] ?? 0 ) > 1
+			|| FW_SM_Multisite::MODE_NETWORK === $uploads_mode;
+
+		if ( FW_SM_Stage::UPLOADS === $stage && $carry_all_sites ) {
 			$excludes = array_values(
 				array_filter(
 					$excludes,
@@ -706,6 +716,23 @@ class FW_SM_Runner {
 
 		if ( is_wp_error( $result ) ) {
 			return $result;
+		}
+
+		// The destination's host only lets theme and plugin files be written from its wp-admin
+		// (WP Engine does this), so it kept everything staged — nothing there has changed yet — and
+		// shows its administrator a "Finish migration" button. That click is the last step.
+		if ( ! empty( $result['queued'] ) ) {
+			FW_SM_State::log(
+				sprintf(
+					/* translators: 1: number of tables, 2: number of files. */
+					__( 'Everything arrived (%1$d tables, %2$d files), but the destination\'s host only allows theme and plugin files to be written from its own wp-admin. To put the migration live, an administrator of the destination opens its wp-admin and clicks "Finish migration". Until then the destination is unchanged.', 'fw' ),
+					(int) ( $result['tables'] ?? 0 ),
+					(int) ( $result['files'] ?? 0 )
+				)
+			);
+
+			// The source's part is done: the stage closes so the migration ends here, not loop on finalize.
+			return [ 'processed_bytes' => 0, 'complete' => true ];
 		}
 
 		FW_SM_State::log(

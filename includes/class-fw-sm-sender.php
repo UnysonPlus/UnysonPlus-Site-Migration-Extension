@@ -624,6 +624,14 @@ class FW_SM_Sender {
 
 		$body = FW_SM_Connection::prepare( $data, $this->key );
 
+		// The destination may take up to self::TIMEOUT seconds to process and
+		// answer a slice. Give this (sender) process more head-room than the HTTP
+		// timeout so PHP's max_execution_time never fires mid-request — otherwise
+		// it fatals inside cURL instead of letting the timeout return a clean
+		// WP_Error the migration can retry. The receiver already raises its own
+		// limit; the sender was left on the global one (often == self::TIMEOUT).
+		@set_time_limit( self::TIMEOUT + 60 ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+
 		$response = wp_remote_post(
 			$this->url . '/wp-admin/admin-ajax.php',
 			[
@@ -766,6 +774,10 @@ class FW_SM_Sender {
 				],
 			];
 		}
+
+		// Same head-room as post(): a batch waits up to self::TIMEOUT for the
+		// slowest call, so keep max_execution_time from firing before it returns.
+		@set_time_limit( self::TIMEOUT + 60 ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
 
 		try {
 			$responses = $requests_class::request_multiple( $requests );

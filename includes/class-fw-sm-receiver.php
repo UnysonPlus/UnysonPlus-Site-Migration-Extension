@@ -56,6 +56,15 @@ class FW_SM_Receiver {
 	const SESSION_TTL = 3600;
 
 	/**
+	 * A migration that arrived complete but waits for an administrator to finish it in wp-admin,
+	 * because this host only lets theme and plugin (.php) files be written from there.
+	 */
+	const FINISH_OPTION     = 'fw_sm_awaiting_finish';
+	const FINISH_RESULT     = 'fw_sm_finish_result';
+	const ACTION_FINISH_IN  = 'fw_sm_finish_incoming';
+	const ACTION_DISCARD_IN = 'fw_sm_discard_incoming';
+
+	/**
 	 * @return void
 	 */
 	public function register() {
@@ -77,6 +86,221 @@ class FW_SM_Receiver {
 			add_action( 'wp_ajax_nopriv_' . $action, [ $this, $method ] );
 			add_action( 'wp_ajax_' . $action, [ $this, $method ] );
 		}
+		if ( is_admin() ) {
+			add_action( 'admin_notices', [ $this, 'finish_notice' ] );
+			add_action( 'network_admin_notices', [ $this, 'finish_notice' ] );
+			add_action( 'admin_post_' . self::ACTION_FINISH_IN, [ $this, 'handle_finish_incoming' ] );
+			add_action( 'admin_post_' . self::ACTION_DISCARD_IN, [ $this, 'handle_discard_incoming' ] );
+		}
+	}
+
+	/**
+	 * Can THIS request create a .php file where theme and plugin code lives?
+	 *
+	 * Tried for real (create, then delete, a throwaway file in the plugins folder) because the
+	 * answer depends on the request, not the folder: WP Engine lets wp-admin write PHP but refuses
+	 * the same write from a request like the migration's, while the folder itself reports writable.
+	 * Hosts that allow it — almost all of them — never see the deferred path.
+	 *
+	 * @return bool
+	 */
+	public static function php_create_allowed() {
+		static $allowed = null;
+
+		if ( null === $allowed ) {
+			$probe   = trailingslashit( WP_PLUGIN_DIR ) . 'fwsm-probe-' . wp_generate_password( 8, false ) . '.php';
+			$allowed = false !== @file_put_contents( $probe, "<?php\n" ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
+
+			if ( $allowed ) {
+				@unlink( $probe ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
+			}
+		}
+
+		/**
+		 * Override the probe — e.g. force the wp-admin "Finish migration" step when testing.
+		 *
+		 * @param bool $allowed Whether this request may create .php files.
+		 */
+		return (bool) apply_filters( 'fw_sm_php_create_allowed', $allowed );
+	}
+
+	/**
+	 * Does this migration stage any .php file (theme, plugin or other code)?
+	 *
+	 * @param array $session
+	 *
+	 * @return bool
+	 */
+	private function staged_has_code( $session ) {
+		$path = self::staged_list_path( $session );
+
+		if ( null === $path || ! is_file( $path ) ) {
+			return false;
+		}
+
+		$handle = @fopen( $path, 'rb' ); // phpcs:ignore WordPress.WP.AlternativeFunctions,WordPress.PHP.NoSilencedErrors.Discouraged
+
+		if ( ! $handle ) {
+			return false;
+		}
+
+		$found  = false;
+		$suffix = '.php' . self::STAGED_SUFFIX;
+
+		while ( false !== ( $line = fgets( $handle ) ) ) { // phpcs:ignore WordPress.WP.AlternativeFunctions
+			if ( substr( strtolower( trim( $line ) ), -strlen( $suffix ) ) === $suffix ) {
+				$found = true;
+				break;
+			}
+		}
+
+		fclose( $handle ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+
+		return $found;
+	}
+
+	/**
+	 * The wp-admin notice: a migration is waiting to be finished, or one just was.
+	 *
+	 * @return void
+	 */
+	public function finish_notice() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			return;
+		}
+
+		$done = get_option( self::FINISH_RESULT );
+
+		if ( is_array( $done ) ) {
+			delete_option( self::FINISH_RESULT );
+			printf(
+				'<div class="notice notice-%1$s is-dismissible upa-keep" id="fw-sm-finish-result"><p><strong>%2$s</strong> %3$s</p></div>',
+				esc_attr( $done['type'] ),
+				esc_html__( 'Site Migration:', 'fw' ),
+				esc_html( $done['message'] )
+			);
+		}
+
+		$waiting = get_option( self::FINISH_OPTION );
+
+		if ( ! is_array( $waiting ) ) {
+			return;
+		}
+
+		$form = function ( $action, $label, $class ) {
+			return '<form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '" style="display:inline-block;margin-right:6px">'
+				. '<input type="hidden" name="action" value="' . esc_attr( $action ) . '">'
+				. wp_nonce_field( $action, '_wpnonce', true, false )
+				. '<button type="submit" class="button ' . esc_attr( $class ) . '">' . esc_html( $label ) . '</button></form>';
+		};
+
+		echo '<div class="notice notice-warning upa-keep" id="fw-sm-finish-notice"><p><strong>'
+			. esc_html__( 'A site migration is waiting for you to finish it.', 'fw' ) . '</strong> '
+			. esc_html(
+				sprintf(
+					/* translators: 1: source site, 2: files, 3: tables. */
+					__( 'Everything from %1$s has arrived (%2$d files, %3$d database tables). This host only lets theme and plugin files be written from wp-admin, so the last step waits for your click. Nothing on this site has changed yet.', 'fw' ),
+					$waiting['source_url'] ? $waiting['source_url'] : __( 'the source site', 'fw' ),
+					(int) $waiting['files'],
+					(int) $waiting['tables']
+				)
+			)
+			. '</p><p>'
+			. $form( self::ACTION_FINISH_IN, __( 'Finish migration', 'fw' ), 'button-primary' ) // phpcs:ignore WordPress.Security.EscapeOutput
+			. $form( self::ACTION_DISCARD_IN, __( 'Discard', 'fw' ), '' ) // phpcs:ignore WordPress.Security.EscapeOutput
+			. '</p></div>';
+	}
+
+	/**
+	 * Check the click, and return the waiting session (redirecting with a note when there is none).
+	 *
+	 * @param string $action
+	 *
+	 * @return array
+	 */
+	private function waiting_session( $action ) {
+		if ( ! current_user_can( 'manage_options' ) || ! check_admin_referer( $action ) ) {
+			wp_die( esc_html__( 'You are not allowed to do that.', 'fw' ), 403 );
+		}
+
+		$session = get_option( self::SESSION_OPTION, null );
+
+		if ( ! is_array( $session ) || empty( $session['awaiting_finish'] ) ) {
+			delete_option( self::FINISH_OPTION );
+			update_option( self::FINISH_RESULT, [ 'type' => 'warning', 'message' => __( 'That migration is no longer waiting here — a newer one replaced it, or it was cleared.', 'fw' ) ], false );
+			wp_safe_redirect( admin_url() );
+			exit;
+		}
+
+		return $session;
+	}
+
+	/**
+	 * Finish a waiting migration from wp-admin, where the host allows the .php writes.
+	 *
+	 * @return void
+	 * @handles admin_post_fw_sm_finish_incoming
+	 */
+	public function handle_finish_incoming() {
+		$session = $this->waiting_session( self::ACTION_FINISH_IN );
+
+		@set_time_limit( 600 ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+
+		$missing = $this->verify_received( $session );
+		$result  = empty( $missing )
+			? $this->complete( $session )
+			: new WP_Error(
+				'fw_sm_missing',
+				sprintf(
+					/* translators: %d: count. */
+					__( 'Not finished: %d received file(s) are no longer on this site\'s disk, so nothing was changed. Run the migration again.', 'fw' ),
+					count( $missing )
+				)
+			);
+
+		delete_option( self::FINISH_OPTION );
+
+		if ( is_wp_error( $result ) ) {
+			$this->discard_staged_files( $session );
+			FW_SM_Importer::drop_staging_tables();
+			$this->finish_session();
+			$notice = [ 'type' => 'error', 'message' => $result->get_error_message() ];
+		} else {
+			$failed = (int) ( $result['swap_failed_count'] ?? 0 );
+			$notice = [
+				'type'    => $failed ? 'warning' : 'success',
+				'message' => $failed
+					/* translators: %d: count. */
+					? sprintf( __( 'Migration finished, but %d file(s) could not be put in place even from wp-admin — this host locks them, so deploy that code with the host\'s own tools.', 'fw' ), $failed )
+					/* translators: 1: tables, 2: files. */
+					: sprintf( __( 'Migration finished: %1$d tables and %2$d files are live.', 'fw' ), (int) $result['swapped'], (int) $result['files'] ),
+			];
+		}
+
+		// Written after the swap, so it lands in the options table that is now live.
+		update_option( self::FINISH_RESULT, $notice, false );
+
+		wp_safe_redirect( admin_url() );
+		exit;
+	}
+
+	/**
+	 * Throw away a waiting migration: its staged files and tables go, nothing else changes.
+	 *
+	 * @return void
+	 * @handles admin_post_fw_sm_discard_incoming
+	 */
+	public function handle_discard_incoming() {
+		$session = $this->waiting_session( self::ACTION_DISCARD_IN );
+
+		$this->discard_staged_files( $session );
+		FW_SM_Importer::drop_staging_tables();
+		$this->finish_session();
+		delete_option( self::FINISH_OPTION );
+		update_option( self::FINISH_RESULT, [ 'type' => 'info', 'message' => __( 'The waiting migration was discarded. Nothing on this site was changed.', 'fw' ) ], false );
+
+		wp_safe_redirect( admin_url() );
+		exit;
 	}
 
 	/**
@@ -385,6 +609,7 @@ class FW_SM_Receiver {
 		];
 
 		update_option( self::SESSION_OPTION, $session, false );
+		delete_option( self::FINISH_OPTION ); // a new migration replaces one still waiting for its Finish click
 
 		$this->respond(
 			[
@@ -667,8 +892,6 @@ class FW_SM_Receiver {
 		$payload = $this->authenticate();
 		$session = $this->session( $payload );
 
-		$importer = new FW_SM_Importer();
-
 		// Replacements go live here, all together, having sat beside their
 		// targets for the whole transfer. Until this moment the destination has
 		// been running exactly the files it started with, which is what makes an
@@ -696,6 +919,46 @@ class FW_SM_Receiver {
 			);
 		}
 
+		// Hosts that refuse to CREATE .php files from a request like this one (WP Engine refuses
+		// them outside wp-admin) would put the database live with the theme and plugin code left
+		// behind — a site running new data on old code. So when the migration carries code and
+		// this request cannot write it, nothing goes live here: everything stays staged and an
+		// administrator finishes it from wp-admin, where the host allows the writes.
+		if ( $this->staged_has_code( $session ) && ! self::php_create_allowed() ) {
+			$session['awaiting_finish'] = time();
+			update_option( self::SESSION_OPTION, $session, false );
+			update_option( self::FINISH_OPTION, [
+				'migration_id' => (string) $session['migration_id'],
+				'source_url'   => (string) ( $session['source_url'] ?? '' ),
+				'files'        => (int) ( $session['files'] ?? 0 ),
+				'tables'       => count( (array) ( $session['tables'] ?? [] ) ),
+				'queued_at'    => time(),
+			], false );
+
+			$this->respond( [ 'queued' => true, 'files' => (int) ( $session['files'] ?? 0 ), 'tables' => count( (array) ( $session['tables'] ?? [] ) ) ] );
+		}
+
+		$result = $this->complete( $session );
+
+		if ( is_wp_error( $result ) ) {
+			$this->fail( $result->get_error_message(), 500 );
+		}
+
+		$this->respond( $result );
+	}
+
+	/**
+	 * Put a fully received migration live: the staged files, then the database swap.
+	 *
+	 * Shared by the source's finalize request and the wp-admin "Finish migration" button.
+	 *
+	 * @param array $session
+	 *
+	 * @return array|WP_Error The summary the source reports.
+	 */
+	private function complete( $session ) {
+		$importer = new FW_SM_Importer();
+
 		$swap = $this->swap_staged_files( $session );
 
 		// Before the swap, and before either exit — a files-only migration
@@ -709,7 +972,7 @@ class FW_SM_Receiver {
 			$fo_examples = [];
 			$fo_left     = $this->sweep_staged_files( false, $fo_examples );
 
-			$this->respond(
+			return (
 				[ 'swapped' => 0, 'files' => (int) $session['files'] ]
 				+ $pruned
 				+ [
@@ -733,7 +996,7 @@ class FW_SM_Receiver {
 		if ( is_wp_error( $swapped ) ) {
 			FW_SM_Importer::drop_staging_tables();
 
-			$this->fail( $swapped->get_error_message(), 500 );
+			return $swapped;
 		}
 
 		FW_SM_Importer::restore_preserved( $preserved, (string) $session['source_prefix'] );
@@ -787,7 +1050,7 @@ class FW_SM_Receiver {
 		$left_examples = [];
 		$left_over     = $this->sweep_staged_files( false, $left_examples );
 
-		$this->respond(
+		return (
 			[
 				'swapped' => count( $session['tables'] ),
 				'files'   => (int) $session['files'],
@@ -2287,6 +2550,7 @@ class FW_SM_Receiver {
 		FW_SM_Importer::drop_staging_tables();
 
 		delete_option( self::SESSION_OPTION );
+		delete_option( self::FINISH_OPTION );
 	}
 
 	/**

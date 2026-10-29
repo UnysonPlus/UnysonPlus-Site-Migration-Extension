@@ -11,7 +11,7 @@ $manifest['description'] = __(
 	'fw'
 );
 
-$manifest['version']    = '1.0.30';
+$manifest['version']    = '1.0.34';
 $manifest['display']    = true;
 $manifest['standalone'] = true;
 $manifest['thumbnail']  = 'thumbnail.svg';
@@ -34,6 +34,20 @@ $manifest['requires_wp']  = '5.8';
 /**
  * Changelog
  * -----------------------------------------------------------------------------
+ * 1.0.32 - "Finish migration" in wp-admin, for hosts that only allow PHP files
+ *          to be written from there. Some managed hosts (WP Engine is the
+ *          confirmed one) refuse to create .php files in a request like the
+ *          migration's while allowing it from wp-admin, so a migration's theme
+ *          and plugin code could never go live and the database landed on top
+ *          of old code. The destination now tests that for real at finalize (a
+ *          throwaway .php in the plugins folder; filter fw_sm_php_create_allowed).
+ *          When the migration carries code and the write is refused, NOTHING
+ *          goes live: the files and tables stay staged and every administrator
+ *          sees "A site migration is waiting for you to finish it" with Finish
+ *          migration / Discard. Finish runs the same finalize from wp-admin;
+ *          the source's log says the click is the last step. Hosts that allow
+ *          the writes finish automatically, exactly as before.
+ *
  * 1.0.30 - The log now names the failure a site owner actually feels. When the
  *          files the destination refused to overwrite include THEME or PLUGIN
  *          code, it says so directly — that this host locks theme and plugin
